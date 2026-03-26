@@ -86,11 +86,26 @@ if current_platform.is_rocm():
                 amdsmi_shut_down()
 elif current_platform.is_cuda():
     from vllm.third_party.pynvml import (
+        NVML_DEVICE_MIG_ENABLE,
+        NVMLError,
         nvmlDeviceGetHandleByIndex,
         nvmlDeviceGetMemoryInfo,
+        nvmlDeviceGetMigDeviceHandleByIndex,
+        nvmlDeviceGetMigMode,
         nvmlInit,
         nvmlShutdown,
     )
+
+    def _get_nvml_memory_info(handle):
+        """Get memory info, using MIG instance handle if MIG is enabled."""
+        try:
+            current, _ = nvmlDeviceGetMigMode(handle)
+            if current == NVML_DEVICE_MIG_ENABLE:
+                mig_handle = nvmlDeviceGetMigDeviceHandleByIndex(handle, 0)
+                return nvmlDeviceGetMemoryInfo(mig_handle)
+        except NVMLError:
+            pass
+        return nvmlDeviceGetMemoryInfo(handle)
 
     @contextmanager
     def _nvml():
@@ -387,7 +402,7 @@ class RemoteVLLMServer:
                     device_count = cuda_device_count_stateless()
                     for i in range(device_count):
                         handle = nvmlDeviceGetHandleByIndex(i)
-                        mem_info = nvmlDeviceGetMemoryInfo(handle)
+                        mem_info = _get_nvml_memory_info(handle)
                         total_used += mem_info.used
                     return total_used
         except Exception as e:
@@ -1219,7 +1234,7 @@ def wait_for_gpu_memory_to_clear(
                 gb_total = mem_info["vram_total"] / 2**10
             else:
                 dev_handle = nvmlDeviceGetHandleByIndex(device)
-                mem_info = nvmlDeviceGetMemoryInfo(dev_handle)
+                mem_info = _get_nvml_memory_info(dev_handle)
                 gb_used = mem_info.used / 2**30
                 gb_total = mem_info.total / 2**30
             output_raw[device] = (gb_used, gb_total)
