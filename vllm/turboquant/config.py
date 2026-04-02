@@ -13,13 +13,17 @@ class TurboQuantConfig:
     Args:
         head_dim: Attention head dimension (e.g. 64, 96, 128).
         total_bits: Total bits per coordinate (3 or 4).
-            MSE stage uses (total_bits - 1) bits, QJL uses 1 bit.
+            When no_qjl=True (default): all bits go to MSE centroids.
+            When no_qjl=False: MSE gets (total_bits - 1), QJL gets 1 bit.
         value_quant_bits: Bits per value dimension for quantization.
             8 = FP8 E4M3 (default, lossless quality, ~2x compression).
             4 = 16 levels uniform (higher compression, quality loss).
             2 = 4 levels uniform (aggressive, severe quality loss).
+        no_qjl: If True (default), skip QJL correction and use all
+            bits for PolarQuant centroids. QJL adds variance that
+            softmax amplifies, hurting quality. See TheTom's
+            turbo4-resurrection research.
         asymmetric: If True, K and V use different bit widths.
-            K uses total_bits, V uses v_total_bits.
         v_total_bits: Total bits for V when asymmetric=True.
         seed: Base seed for deterministic random matrix generation.
             Actual seed per layer = seed + layer_idx * 1337.
@@ -27,12 +31,15 @@ class TurboQuantConfig:
     head_dim: int = 128
     total_bits: int = 3
     value_quant_bits: int = 8  # FP8 by default — lossless quality
+    no_qjl: bool = True  # all bits for centroids, no QJL correction
     asymmetric: bool = False
     v_total_bits: int = 3  # only used when asymmetric=True
     seed: int = 42
 
     @property
     def mse_bits(self) -> int:
+        if self.no_qjl:
+            return self.total_bits  # all bits for centroids
         return max(self.total_bits - 1, 1)
 
     @property
@@ -50,16 +57,21 @@ class TurboQuantConfig:
     def key_packed_size(self) -> int:
         """Packed bytes for a single compressed KEY vector.
 
-        Layout:
+        With QJL (no_qjl=False):
           - MSE indices: ceil(head_dim * mse_bits / 8) bytes
           - QJL signs:   ceil(head_dim / 8) bytes
           - vec_norm:     2 bytes (float16)
           - res_norm:     2 bytes (float16)
+
+        Without QJL (no_qjl=True, default):
+          - MSE indices: ceil(head_dim * mse_bits / 8) bytes
+          - vec_norm:     2 bytes (float16)
         """
         mse_bytes = math.ceil(self.head_dim * self.mse_bits / 8)
+        if self.no_qjl:
+            return mse_bytes + 2  # indices + vec_norm only
         qjl_bytes = math.ceil(self.head_dim / 8)
-        norm_bytes = 4  # 2x float16
-        return mse_bytes + qjl_bytes + norm_bytes
+        return mse_bytes + qjl_bytes + 4  # indices + QJL + vec_norm + res_norm
 
     @property
     def effective_value_quant_bits(self) -> int:
@@ -114,17 +126,21 @@ class TurboQuantConfig:
         vqb_env = os.environ.get("TQ_VALUE_BITS")
         if vqb_env is not None:
             value_quant_bits = int(vqb_env)
+        no_qjl = os.environ.get("TQ_NO_QJL", "1") == "1"
 
         if cache_dtype == "tq3":
             return TurboQuantConfig(head_dim=head_dim, total_bits=3,
-                                    value_quant_bits=value_quant_bits)
+                                    value_quant_bits=value_quant_bits,
+                                    no_qjl=no_qjl)
         elif cache_dtype == "tq4":
             return TurboQuantConfig(head_dim=head_dim, total_bits=4,
-                                    value_quant_bits=value_quant_bits)
+                                    value_quant_bits=value_quant_bits,
+                                    no_qjl=no_qjl)
         elif cache_dtype == "tq_k4v3":
             return TurboQuantConfig(head_dim=head_dim, total_bits=4,
                                     asymmetric=True, v_total_bits=3,
-                                    value_quant_bits=value_quant_bits)
+                                    value_quant_bits=value_quant_bits,
+                                    no_qjl=no_qjl)
         else:
             raise ValueError(f"Unknown TurboQuant cache dtype: {cache_dtype}")
 

@@ -459,24 +459,27 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # 2. Rotate: y = x_hat @ Pi.T
         y = x_hat @ PiT
 
-        # 3. Threshold quantize: bucketize into 4 sorted centroid bins
-        #    Single kernel, no (N*H, D, 4) temporary like argmin
+        # 3. Threshold quantize
         idx = torch.bucketize(y, midpoints).to(torch.uint8)
 
-        # 4. Reconstruct in rotated domain (no GEMM needed)
-        y_hat = centroids[idx.long()]
-
-        # 5. Residual in rotated domain: r_rot = y - y_hat
-        #    ||r|| = ||r_rot|| because Pi is orthogonal
-        r_rot = y - y_hat
-        gamma = r_rot.norm(dim=1, keepdim=True)
-
-        # 6. QJL signs: projected = r @ S.T = r_rot @ (Pi @ S.T)
-        projected = r_rot @ Pi_S_T
-        signs = (projected >= 0).to(torch.uint8)
+        # 4-6. QJL residual (skip when no_qjl for speed)
+        if not self.tq_config.no_qjl:
+            y_hat = centroids[idx.long()]
+            r_rot = y - y_hat
+            gamma = r_rot.norm(dim=1, keepdim=True)
+            projected = r_rot @ Pi_S_T
+            signs = (projected >= 0).to(torch.uint8)
 
         # 7. Pack MSE indices (vectorized bit packing)
-        if mse_bits == 2 and D % 4 == 0:
+        if mse_bits == 4 and D % 2 == 0:
+            # Nibble packing: 2 indices per byte (turbo4 proper)
+            idx_r = idx.reshape(-1, D // 2, 2)
+            packed_mse = (idx_r[:, :, 0].int() | (idx_r[:, :, 1].int() << 4)).to(torch.uint8)
+        elif mse_bits == 3 and D % 2 == 0:
+            # 3-bit: also use nibble packing (waste 1 bit per nibble but avoid byte-spanning)
+            idx_r = idx.reshape(-1, D // 2, 2)
+            packed_mse = (idx_r[:, :, 0].int() | (idx_r[:, :, 1].int() << 4)).to(torch.uint8)
+        elif mse_bits == 2 and D % 4 == 0:
             idx_r = idx.reshape(-1, D // 4, 4)
             packed_mse = (idx_r.int() << self._shift_2bit).sum(-1).to(torch.uint8)
         else:
@@ -493,25 +496,28 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         (idx_u8[:, j].int() >> (8 - si)) & 0xFF
                     ).to(torch.uint8)
 
-        # 8. Pack QJL signs
-        if D % 8 == 0:
-            signs_r = signs.reshape(-1, D // 8, 8)
-            packed_signs = (signs_r.int() << self._shift_8bit).sum(-1).to(torch.uint8)
-        else:
-            packed_signs = torch.zeros(N * H, qjl_bytes_n,
-                                       dtype=torch.uint8, device=device)
-            for j in range(D):
-                packed_signs[:, j // 8] |= (signs[:, j] << (j % 8))
-
-        # 9. Pack norms
+        # 8. Pack norms (and QJL if enabled)
+        no_qjl = self.tq_config.no_qjl
         norm_b = norms.squeeze(-1).half().contiguous().view(
             torch.uint8).reshape(-1, 2)
-        gamma_b = gamma.squeeze(-1).half().contiguous().view(
-            torch.uint8).reshape(-1, 2)
 
-        # 10. Concat → (N*H, kps)
-        packed_key = torch.cat(
-            [packed_mse, packed_signs, norm_b, gamma_b], dim=1)
+        if no_qjl:
+            # No QJL: key = [MSE indices | vec_norm]
+            packed_key = torch.cat([packed_mse, norm_b], dim=1)
+        else:
+            # With QJL: key = [MSE indices | QJL signs | vec_norm | res_norm]
+            if D % 8 == 0:
+                signs_r = signs.reshape(-1, D // 8, 8)
+                packed_signs = (signs_r.int() << self._shift_8bit).sum(-1).to(torch.uint8)
+            else:
+                packed_signs = torch.zeros(N * H, qjl_bytes_n,
+                                           dtype=torch.uint8, device=device)
+                for j in range(D):
+                    packed_signs[:, j // 8] |= (signs[:, j] << (j % 8))
+            gamma_b = gamma.squeeze(-1).half().contiguous().view(
+                torch.uint8).reshape(-1, 2)
+            packed_key = torch.cat(
+                [packed_mse, packed_signs, norm_b, gamma_b], dim=1)
 
         # 11. Value quantization
         vps = self.tq_config.value_packed_size
@@ -835,22 +841,28 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         kps = self.tq_config.key_packed_size
         mse_bits = self.tq_config.mse_bits
         mse_bytes_n = math.ceil(D * mse_bits / 8)
-        qjl_bytes_n = math.ceil(D / 8)
+        no_qjl = self.tq_config.no_qjl
         block_size = kv_cache.shape[1]
         device = query.device
-        correction = math.sqrt(math.pi / 2) / D
 
-        # Precompute rotated / projected queries — fast GEMM
+        # Precompute rotated queries
         q_float = query.float()
         q_rot = q_float @ Pi.T    # (B, Hq, D)
-        q_proj = q_float @ S.T    # (B, Hq, D)
+        if not no_qjl:
+            q_proj = q_float @ S.T
+            correction = math.sqrt(math.pi / 2) / D
+            qjl_bytes_n = math.ceil(D / 8)
+            sign_sh = torch.arange(8, device=device, dtype=torch.int32)
 
-        # Bit-unpacking shift constants (created once, reused per request)
+        # Bit-unpacking shift constants
         if mse_bits == 2:
             mse_sh = torch.tensor([0, 2, 4, 6], device=device,
                                   dtype=torch.int32)
             mse_mask = 0x3
-        sign_sh = torch.arange(8, device=device, dtype=torch.int32)
+        elif mse_bits == 4 or mse_bits == 3:
+            # Nibble packing: shift by 0 and 4
+            mse_sh = torch.tensor([0, 4], device=device, dtype=torch.int32)
+            mse_mask = 0xF
 
         outputs = []
         for i in range(B):
@@ -865,7 +877,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             blk_idx = attn_metadata.block_table[
                 i, pos // block_size].long()
             blk_off = (pos % block_size).long()
-            # slots: (S, Hk, slot_size) uint8
             slots = kv_cache[blk_idx, blk_off]
 
             # --- Unpack MSE indices → (S, Hk, D) ------------------- #
@@ -874,59 +885,65 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 expanded = mse_raw.unsqueeze(-1).int() >> mse_sh
                 idx = (expanded & mse_mask).reshape(
                     seq_len, Hk, -1)[:, :, :D]
+            elif (mse_bits == 4 or mse_bits == 3) and D % 2 == 0:
+                # Nibble unpack: 2 indices per byte
+                expanded = mse_raw.unsqueeze(-1).int() >> mse_sh
+                idx = (expanded & mse_mask).reshape(
+                    seq_len, Hk, -1)[:, :, :D]
             else:
-                # Generic 3-bit (or unaligned) vectorized unpack
                 j = torch.arange(D, device=device)
                 bo = j * mse_bits
                 bi = (bo // 8).long()
                 si = (bo % 8).int()
-                b0 = mse_raw[:, :, bi]          # (S, Hk, D)
-                val = (b0.int() >> si) & ((1 << mse_bits) - 1)
-                if mse_bits == 3:
-                    cross = si > 5
-                    bi_n = (bi + 1).clamp(max=mse_bytes_n - 1)
-                    b1 = mse_raw[:, :, bi_n]
-                    extra = (b1.int() << (8 - si)) & 0x7
-                    val = torch.where(cross, val | extra, val)
-                idx = val
+                b0 = mse_raw[:, :, bi]
+                idx = (b0.int() >> si) & ((1 << mse_bits) - 1)
 
             c_vals = centroids[idx.long()]       # (S, Hk, D)
 
-            # --- Unpack QJL signs → (S, Hk, D) --------------------- #
-            sign_raw = slots[
-                :, :, mse_bytes_n:mse_bytes_n + qjl_bytes_n]
-            if D % 8 == 0:
-                s_exp = sign_raw.unsqueeze(-1).int() >> sign_sh
-                signs_01 = (s_exp & 1).reshape(
-                    seq_len, Hk, -1)[:, :, :D]
-            else:
-                j = torch.arange(D, device=device)
-                s_byte = sign_raw[:, :, j // 8]
-                signs_01 = (s_byte.int() >> (j % 8).int()) & 1
-            signs_f = signs_01.float() * 2.0 - 1.0
-
             # --- Unpack norms --------------------------------------- #
-            noff = mse_bytes_n + qjl_bytes_n
-            nd = slots[:, :, noff:noff + 2].contiguous()
-            gd = slots[:, :, noff + 2:noff + 4].contiguous()
-            vec_norms = nd.view(torch.float16).squeeze(-1).float()
-            gammas = gd.view(torch.float16).squeeze(-1).float()
+            if no_qjl:
+                noff = mse_bytes_n
+                nd = slots[:, :, noff:noff + 2].contiguous()
+                vec_norms = nd.view(torch.float16).squeeze(-1).float()
+            else:
+                qjl_bytes_n_local = math.ceil(D / 8)
+                sign_raw = slots[
+                    :, :, mse_bytes_n:mse_bytes_n + qjl_bytes_n_local]
+                if D % 8 == 0:
+                    s_exp = sign_raw.unsqueeze(-1).int() >> sign_sh
+                    signs_01 = (s_exp & 1).reshape(
+                        seq_len, Hk, -1)[:, :, :D]
+                else:
+                    j = torch.arange(D, device=device)
+                    s_byte = sign_raw[:, :, j // 8]
+                    signs_01 = (s_byte.int() >> (j % 8).int()) & 1
+                signs_f = signs_01.float() * 2.0 - 1.0
+
+                noff = mse_bytes_n + qjl_bytes_n_local
+                nd = slots[:, :, noff:noff + 2].contiguous()
+                gd = slots[:, :, noff + 2:noff + 4].contiguous()
+                vec_norms = nd.view(torch.float16).squeeze(-1).float()
+                gammas = gd.view(torch.float16).squeeze(-1).float()
 
             # --- GQA head expansion --------------------------------- #
             if Hk < Hq:
                 g = self.num_kv_groups
                 c_vals = c_vals.repeat_interleave(g, dim=1)
-                signs_f = signs_f.repeat_interleave(g, dim=1)
                 vec_norms = vec_norms.repeat_interleave(g, dim=1)
-                gammas = gammas.repeat_interleave(g, dim=1)
+                if not no_qjl:
+                    signs_f = signs_f.repeat_interleave(g, dim=1)
+                    gammas = gammas.repeat_interleave(g, dim=1)
 
             # --- TQ score computation ------------------------------- #
             q_rot_i = q_rot[i]     # (Hq, D)
-            q_proj_i = q_proj[i]   # (Hq, D)
             term1 = torch.einsum('hd,shd->sh', q_rot_i, c_vals)
-            term2 = torch.einsum('hd,shd->sh', q_proj_i, signs_f)
-            scores = vec_norms * (
-                term1 + correction * gammas * term2) * self.scale
+            if no_qjl:
+                scores = vec_norms * term1 * self.scale
+            else:
+                q_proj_i = q_proj[i]
+                term2 = torch.einsum('hd,shd->sh', q_proj_i, signs_f)
+                scores = vec_norms * (
+                    term1 + correction * gammas * term2) * self.scale
 
             # --- Softmax + value weighted sum ----------------------- #
             attn_w = torch.softmax(scores.T, dim=-1)      # (Hq, S)
