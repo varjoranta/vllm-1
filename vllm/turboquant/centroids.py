@@ -1,68 +1,89 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Lloyd-Max optimal centroids for N(0, 1/d) Gaussian distribution.
+"""Lloyd-Max optimal scalar quantizer for TurboQuant.
 
-Precomputed codebooks for TurboQuant. These are data-oblivious: the same
-centroids work for any model because after WHT rotation, coordinates
-are approximately Gaussian with variance 1/d.
+After rotating a d-dimensional unit vector by a random orthogonal matrix,
+each coordinate approximately follows N(0, 1/d) for d >= 64.
+We solve the Lloyd-Max conditions to find optimal centroids.
+
+Based on: turboquant-pytorch/lloyd_max.py (Zandieh et al.)
 """
 
 import math
+from functools import lru_cache
 
-from scipy import stats
+import torch
 
 
-def lloyd_max_centroids(n_centroids: int, sigma: float,
-                        n_iter: int = 100) -> list[float]:
-    """Compute optimal scalar quantization centroids via Lloyd's algorithm.
+def _gaussian_pdf(x: float, sigma2: float) -> float:
+    return (1.0 / math.sqrt(2 * math.pi * sigma2)) * math.exp(
+        -x * x / (2 * sigma2)
+    )
+
+
+def solve_lloyd_max(
+    d: int,
+    bits: int,
+    max_iter: int = 200,
+    tol: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Solve Lloyd-Max optimal quantizer for N(0, 1/d) distribution.
 
     Args:
-        n_centroids: number of centroids (2^bits)
-        sigma: standard deviation of the Gaussian distribution
-        n_iter: number of Lloyd iterations
+        d: Vector dimension (determines variance = 1/d).
+        bits: Number of quantization bits.
+        max_iter: Maximum Lloyd-Max iterations.
+        tol: Convergence tolerance.
 
     Returns:
-        Sorted list of centroid values
+        centroids: Sorted tensor of 2^bits optimal centroids.
+        boundaries: Sorted tensor of 2^bits - 1 decision boundaries.
     """
-    if n_centroids == 2:
-        c = math.sqrt(2.0 / math.pi) * sigma
-        return [-c, c]
+    from scipy import integrate
 
-    if n_centroids == 4:
-        centroids = [-1.51 * sigma, -0.453 * sigma, 0.453 * sigma, 1.51 * sigma]
-        return centroids
+    n_levels = 2**bits
+    sigma2 = 1.0 / d
+    sigma = math.sqrt(sigma2)
 
-    # Initialize boundaries from quantiles
-    boundaries = [float(stats.norm.ppf(i / n_centroids, scale=sigma))
-                  for i in range(1, n_centroids)]
-    centroids = [0.0] * n_centroids
+    def pdf(x):
+        return _gaussian_pdf(x, sigma2)
 
-    def cond_exp(a: float, b: float) -> float:
-        a_s = a / sigma if math.isfinite(a) else a
-        b_s = b / sigma if math.isfinite(b) else b
-        if not math.isfinite(a_s):
-            prob = stats.norm.cdf(b_s)
-        elif not math.isfinite(b_s):
-            prob = stats.norm.sf(a_s)
-        else:
-            prob = stats.norm.cdf(b_s) - stats.norm.cdf(a_s)
-        if prob < 1e-15:
-            return ((a if math.isfinite(a) else 0) +
-                    (b if math.isfinite(b) else 0)) / 2
-        return sigma * (stats.norm.pdf(a_s) - stats.norm.pdf(b_s)) / prob
+    lo, hi = -3.5 * sigma, 3.5 * sigma
+    centroids = [lo + (hi - lo) * (i + 0.5) / n_levels for i in range(n_levels)]
 
-    for _ in range(n_iter):
-        centroids[0] = cond_exp(-math.inf, boundaries[0])
-        for i in range(1, n_centroids - 1):
-            centroids[i] = cond_exp(boundaries[i - 1], boundaries[i])
-        centroids[-1] = cond_exp(boundaries[-1], math.inf)
-        boundaries = [(centroids[i] + centroids[i + 1]) / 2
-                      for i in range(n_centroids - 1)]
+    for _ in range(max_iter):
+        boundaries = [
+            (centroids[i] + centroids[i + 1]) / 2.0 for i in range(n_levels - 1)
+        ]
+        edges = [lo * 3] + boundaries + [hi * 3]
+        new_centroids = []
+        for i in range(n_levels):
+            a, b = edges[i], edges[i + 1]
+            num, _ = integrate.quad(lambda x: x * pdf(x), a, b)
+            den, _ = integrate.quad(pdf, a, b)
+            new_centroids.append(num / den if den > 1e-15 else centroids[i])
 
-    centroids.sort()
+        if max(abs(new_centroids[i] - centroids[i]) for i in range(n_levels)) < tol:
+            break
+        centroids = new_centroids
+
+    boundaries = [
+        (centroids[i] + centroids[i + 1]) / 2.0 for i in range(n_levels - 1)
+    ]
+    return (
+        torch.tensor(centroids, dtype=torch.float32),
+        torch.tensor(boundaries, dtype=torch.float32),
+    )
+
+
+@lru_cache(maxsize=32)
+def get_centroids(d: int, bits: int) -> torch.Tensor:
+    """Get precomputed Lloyd-Max centroids (cached)."""
+    centroids, _ = solve_lloyd_max(d, bits)
     return centroids
 
 
-def optimal_centroids(bits: int, dim: int) -> list[float]:
-    """Get optimal centroids for N(0, 1/d) at given bit width."""
-    sigma = 1.0 / math.sqrt(dim)
-    return lloyd_max_centroids(1 << bits, sigma)
+@lru_cache(maxsize=32)
+def get_boundaries(d: int, bits: int) -> torch.Tensor:
+    """Get precomputed Lloyd-Max boundaries (cached)."""
+    _, boundaries = solve_lloyd_max(d, bits)
+    return boundaries
