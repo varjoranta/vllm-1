@@ -79,6 +79,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
         "tq3",
         "tq4",
+        "tq_k4v3",
     ]
 
     @staticmethod
@@ -128,7 +129,7 @@ class TurboQuantAttentionBackend(AttentionBackend):
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return False
-        return kv_cache_dtype in ("tq3", "tq4")
+        return kv_cache_dtype in ("tq3", "tq4", "tq_k4v3")
 
     @classmethod
     def supports_head_size(cls, head_size: int) -> bool:

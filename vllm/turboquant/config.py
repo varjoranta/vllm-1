@@ -20,6 +20,11 @@ class TurboQuantConfig:
         hybrid: If True, store values as FP8 regardless of value_quant_bits.
             Keys use full TQ compression, values use FP8 E4M3.
             Gives ~2x compression with faster decode (no nibble dequant).
+        asymmetric: If True, K and V use different bit widths.
+            K uses total_bits, V uses v_total_bits.
+        v_total_bits: Total bits for V when asymmetric=True.
+            Allows e.g. K=4bit V=3bit for better K precision (softmax
+            routing is sensitive to key accuracy).
         seed: Base seed for deterministic random matrix generation.
             Actual seed per layer = seed + layer_idx * 1337.
     """
@@ -27,11 +32,20 @@ class TurboQuantConfig:
     total_bits: int = 3
     value_quant_bits: int = 4  # 8 = FP8 (E4M3), 2 = 2-bit uniform, 4 = 4-bit uniform
     hybrid: bool = False  # K=TQ3 + V=FP8 mode
+    asymmetric: bool = False
+    v_total_bits: int = 3  # only used when asymmetric=True
     seed: int = 42
 
     @property
     def mse_bits(self) -> int:
         return max(self.total_bits - 1, 1)
+
+    @property
+    def v_mse_bits(self) -> int:
+        """MSE bits for V (same as K unless asymmetric)."""
+        if self.asymmetric:
+            return max(self.v_total_bits - 1, 1)
+        return self.mse_bits
 
     @property
     def n_centroids(self) -> int:
@@ -118,6 +132,11 @@ class TurboQuantConfig:
                                     hybrid=hybrid)
         elif cache_dtype == "tq4":
             return TurboQuantConfig(head_dim=head_dim, total_bits=4,
+                                    value_quant_bits=value_quant_bits,
+                                    hybrid=hybrid)
+        elif cache_dtype == "tq_k4v3":
+            return TurboQuantConfig(head_dim=head_dim, total_bits=4,
+                                    asymmetric=True, v_total_bits=3,
                                     value_quant_bits=value_quant_bits,
                                     hybrid=hybrid)
         else:
