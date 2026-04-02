@@ -14,19 +14,22 @@ class TurboQuantConfig:
         head_dim: Attention head dimension (e.g. 64, 96, 128).
         total_bits: Total bits per coordinate (3 or 4).
             MSE stage uses (total_bits - 1) bits, QJL uses 1 bit.
-        value_quant_bits: Bits per value dimension for uniform quantization.
-            2 = 4 levels (aggressive, ~6x compression).
-            4 = 16 levels (higher quality, ~3x compression).
-        hybrid: If True, store values as FP8 regardless of value_quant_bits.
-            Keys use full TQ compression, values use FP8 E4M3.
-            Gives ~2x compression with faster decode (no nibble dequant).
+        value_quant_bits: Bits per value dimension for quantization.
+            8 = FP8 E4M3 (default — lossless quality, ~2x compression).
+            4 = 16 levels uniform (higher compression, quality loss).
+            2 = 4 levels uniform (aggressive, severe quality loss).
+            Community testing confirmed 4-bit/2-bit values destroy
+            reasoning quality (0% gsm8k). FP8 restores it fully.
+            See: github.com/vllm-project/vllm/pull/38479 discussion.
+        hybrid: If True, force FP8 values regardless of value_quant_bits.
+            Kept for backward compat — FP8 is now the default anyway.
         seed: Base seed for deterministic random matrix generation.
             Actual seed per layer = seed + layer_idx * 1337.
     """
     head_dim: int = 128
     total_bits: int = 3
-    value_quant_bits: int = 4  # 8 = FP8 (E4M3), 2 = 2-bit uniform, 4 = 4-bit uniform
-    hybrid: bool = False  # K=TQ3 + V=FP8 mode
+    value_quant_bits: int = 8  # FP8 default — lossless quality
+    hybrid: bool = False
     seed: int = 42
 
     @property
@@ -105,7 +108,7 @@ class TurboQuantConfig:
 
     @staticmethod
     def from_cache_dtype(cache_dtype: str, head_dim: int,
-                         value_quant_bits: int = 4) -> "TurboQuantConfig":
+                         value_quant_bits: int = 8) -> "TurboQuantConfig":
         # Allow env var override for value quantization bits
         vqb_env = os.environ.get("TQ_VALUE_BITS")
         if vqb_env is not None:
