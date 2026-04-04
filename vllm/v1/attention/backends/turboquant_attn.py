@@ -219,11 +219,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.num_kv_groups = num_heads // num_kv_heads
         self.kv_cache_dtype = kv_cache_dtype
 
-        from vllm.turboquant.config import TurboQuantConfig
-        self.tq_config = TurboQuantConfig.from_cache_dtype(kv_cache_dtype, head_size)
+        # head_size here is effective_head_size (padded_slot_size // 2),
+        # NOT the actual model head_dim. We store the kv_cache_dtype and
+        # create the real config in _ensure_on_device once we can read
+        # the actual head_dim from the layer's Pi matrix.
+        self._tq_cache_dtype = kv_cache_dtype
+        self.tq_config = None
 
-        # Cached shift tensors for bit-packing (avoid re-creating each call)
-        # Will be moved to correct device on first forward call
         self._shift_2bit = torch.tensor([0, 2, 4, 6], dtype=torch.int32)
         self._shift_4bit = torch.tensor([0, 4], dtype=torch.int32)
         self._shift_8bit = torch.arange(8, dtype=torch.int32)
@@ -232,6 +234,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
     def _ensure_on_device(self, layer, device):
         """One-time migration of TQ buffers to the correct device."""
         Pi = layer._tq_Pi
+
+        # Create config with actual head_dim (from Pi matrix shape)
+        if self.tq_config is None:
+            from vllm.turboquant.config import TurboQuantConfig
+            actual_head_dim = Pi.shape[0]
+            self.tq_config = TurboQuantConfig.from_cache_dtype(
+                self._tq_cache_dtype, actual_head_dim)
         if Pi.device != device:
             layer._tq_Pi = Pi.to(device)
             layer._tq_S = layer._tq_S.to(device)
