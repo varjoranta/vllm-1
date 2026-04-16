@@ -20,6 +20,7 @@ The following are the supported quantization formats for vLLM:
 - [AMD Quark](quark.md)
 - [Quantized KV Cache](quantized_kvcache.md)
 - [TorchAO](torchao.md)
+- [TurboQuant](turboquant.md)
 
 ## Supported Hardware
 
@@ -52,6 +53,7 @@ th:not(:first-child) {
 | Marlin (GPTQ/AWQ/FP8/FP4) | ❌    | ✅︎*    | ✅︎     | ✅︎  | ✅︎     | ❌      | ❌        | ❌      |
 | INT8 (W8A8)               | ❌    | ✅︎     | ✅︎     | ✅︎  | ✅︎     | ❌      | ❌        | ✅︎      |
 | FP8 (W8A8)                | ❌    | ❌     | ❌     | ✅︎  | ✅︎     | ✅︎      | ❌        | ❌      |
+| TurboQuant                | ❌    | ❌     | ✅︎     | ✅︎  | ✅︎     | ❌      | ❌        | ❌      |
 | bitsandbytes              | ✅︎    | ✅︎     | ✅︎     | ✅︎  | ✅︎     | ❌      | ❌        | ❌      |
 | DeepSpeedFP               | ✅︎    | ✅︎     | ✅︎     | ✅︎  | ✅︎     | ❌      | ❌        | ❌      |
 | GGUF                      | ✅︎    | ✅︎     | ✅︎     | ✅︎  | ✅︎     | ✅︎      | ❌        | ❌      |
