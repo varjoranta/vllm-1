@@ -23,7 +23,9 @@ class OnlineQuantScheme(Enum):
     # Linear layers remain unquantized.
     INT8_PER_CHANNEL_WEIGHT_ONLY = "int8_per_channel_weight_only"
 
-    # TODO(future PRs): add more online quant schemes here: mxfp8, etc
+    # 3-4 bit weight compression via WHT rotation + Lloyd-Max codebook.
+    # ~4x smaller weights, zero calibration data.
+    TURBOQUANT = "turboquant"
 
 
 @config
