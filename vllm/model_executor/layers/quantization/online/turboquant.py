@@ -25,6 +25,9 @@ from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
 )
+from vllm.model_executor.layers.quantization.turboquant.quantizer import (
+    generate_wht_signs,
+)
 from vllm.model_executor.model_loader.reload.layerwise import (
     initialize_online_processing,
 )
@@ -84,10 +87,12 @@ class _PolarQuant:
             dev = torch.device("cuda", torch.cuda.current_device())
         self.device = dev
 
-        gen = torch.Generator(device="cpu").manual_seed(seed)
+        # Reuse the shared sign-vector helper (added in #38479). Two
+        # independent seeds keep signs1 and signs2 uncorrelated — both
+        # are needed by the randomized Walsh-Hadamard rotation.
         self.padded_dim = next_power_of_2(dim)
-        self.signs1 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(dev)
-        self.signs2 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(dev)
+        self.signs1 = generate_wht_signs(self.padded_dim, seed=seed, device=dev)
+        self.signs2 = generate_wht_signs(self.padded_dim, seed=seed + 1, device=dev)
 
         # Reuse the Lloyd-Max codebook from the KV-cache TurboQuant module
         # (added in #38479). It's scipy-free (trapezoid integration) and
