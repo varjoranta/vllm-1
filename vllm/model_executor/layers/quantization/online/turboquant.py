@@ -22,6 +22,9 @@ import torch.nn as nn
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearMethodBase
+from vllm.model_executor.layers.quantization.turboquant.centroids import (
+    get_centroids,
+)
 from vllm.model_executor.model_loader.reload.layerwise import (
     initialize_online_processing,
 )
@@ -29,55 +32,6 @@ from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.utils.math_utils import next_power_of_2, round_up
 
 logger = init_logger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Codebook: Lloyd-Max optimal centroids for N(0, 1/d)
-# ---------------------------------------------------------------------------
-
-
-def _gaussian_cond_expect(sigma: float, a: float, b: float) -> float:
-    """E[X | a < X < b] for X ~ N(0, sigma^2)."""
-    from scipy import stats
-
-    a_std = a / sigma if math.isfinite(a) else a
-    b_std = b / sigma if math.isfinite(b) else b
-    if not math.isfinite(a_std):
-        prob = stats.norm.cdf(b_std)
-    elif not math.isfinite(b_std):
-        prob = stats.norm.sf(a_std)
-    else:
-        prob = stats.norm.cdf(b_std) - stats.norm.cdf(a_std)
-    if prob < 1e-15:
-        return (a + b) / 2.0 if math.isfinite(a) and math.isfinite(b) else 0.0
-    return sigma * (stats.norm.pdf(a_std) - stats.norm.pdf(b_std)) / prob
-
-
-def _lloyd_max_centroids(n: int, sigma: float, n_iter: int = 100) -> list[float]:
-    """Lloyd's algorithm for optimal scalar quantization of N(0, sigma^2)."""
-    from scipy import stats
-
-    boundaries = list(stats.norm.ppf([i / n for i in range(1, n)], scale=sigma))
-    centroids = [0.0] * n
-    for _ in range(n_iter):
-        centroids[0] = _gaussian_cond_expect(sigma, -math.inf, boundaries[0])
-        for i in range(1, n - 1):
-            centroids[i] = _gaussian_cond_expect(sigma, boundaries[i - 1], boundaries[i])
-        centroids[-1] = _gaussian_cond_expect(sigma, boundaries[-1], math.inf)
-        boundaries = [(centroids[i] + centroids[i + 1]) / 2 for i in range(n - 1)]
-    return sorted(centroids)
-
-
-def _optimal_centroids(bits: int, dim: int) -> list[float]:
-    """Optimal centroids for post-rotation coordinates ~ N(0, 1/d)."""
-    n = 1 << bits
-    if bits == 1:
-        c = math.sqrt(2.0 / (math.pi * dim))
-        return [-c, c]
-    if bits == 2:
-        s = math.sqrt(dim)
-        return [-1.51 / s, -0.453 / s, 0.453 / s, 1.51 / s]
-    return _lloyd_max_centroids(n, sigma=1.0 / math.sqrt(dim))
 
 
 # ---------------------------------------------------------------------------
@@ -135,8 +89,10 @@ class _PolarQuant:
         self.signs1 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(dev)
         self.signs2 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(dev)
 
-        centroids_list = _optimal_centroids(bits, dim)
-        self.centroids = torch.tensor(centroids_list, dtype=torch.float32, device=dev)
+        # Reuse the Lloyd-Max codebook from the KV-cache TurboQuant module
+        # (added in #38479). It's scipy-free (trapezoid integration) and
+        # cached via lru_cache on (dim, bits).
+        self.centroids = get_centroids(dim, bits).to(dev)
         self.boundaries = (self.centroids[:-1] + self.centroids[1:]) / 2
 
     def _rotate(self, x: torch.Tensor) -> torch.Tensor:

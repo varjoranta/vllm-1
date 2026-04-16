@@ -10,8 +10,6 @@ These are all CPU-only and can run without a GPU.
 Run: python -m pytest tests/quantization/test_turboquant_online.py -v
 """
 
-import math
-
 import pytest
 import torch
 import torch.nn as nn
@@ -20,8 +18,6 @@ from vllm.model_executor.layers.quantization.online.turboquant import (
     TurboQuantOnlineLinearMethod,
     _fast_wht_batch,
     _get_quantizer,
-    _lloyd_max_centroids,
-    _optimal_centroids,
     _pack_indices,
     _padded_size,
     _PolarQuant,
@@ -29,43 +25,9 @@ from vllm.model_executor.layers.quantization.online.turboquant import (
 )
 from vllm.utils.math_utils import next_power_of_2
 
-# ============================================================================
-# Codebook tests
-# ============================================================================
-
-
-class TestCodebook:
-    @pytest.mark.parametrize("bits", [2, 3, 4])
-    def test_centroid_count(self, bits):
-        centroids = _optimal_centroids(bits, dim=128)
-        assert len(centroids) == 2**bits
-
-    @pytest.mark.parametrize("bits", [2, 3, 4])
-    def test_centroids_sorted(self, bits):
-        centroids = _optimal_centroids(bits, dim=128)
-        for i in range(len(centroids) - 1):
-            assert centroids[i] < centroids[i + 1]
-
-    @pytest.mark.parametrize("bits", [2, 3, 4])
-    def test_centroids_symmetric(self, bits):
-        centroids = _optimal_centroids(bits, dim=128)
-        assert abs(centroids[0] + centroids[-1]) < 1e-3
-
-    @pytest.mark.parametrize("bits", [3, 4])
-    def test_lloyd_max_converges(self, bits):
-        sigma = 1.0 / math.sqrt(128)
-        centroids = _lloyd_max_centroids(2**bits, sigma)
-        assert len(centroids) == 2**bits
-        for c in centroids:
-            assert abs(c) < 4 * sigma
-
-    @pytest.mark.parametrize("dim", [64, 128, 256, 512])
-    def test_centroids_scale_with_dim(self, dim):
-        """Centroids should scale as ~1/sqrt(dim) for post-rotation coordinates."""
-        c = _optimal_centroids(3, dim)
-        # Magnitude should decrease with increasing dim
-        max_c = max(abs(v) for v in c)
-        assert max_c < 2.0 / math.sqrt(dim)
+# Codebook correctness is tested in tests/quantization/test_turboquant.py
+# (covers the shared vllm.model_executor.layers.quantization.turboquant.centroids
+# module this PR reuses).
 
 
 # ============================================================================
