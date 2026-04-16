@@ -112,7 +112,12 @@ class OnlineQuantizationConfig(QuantizationConfig):
                 )
                 return UnquantizedLinearMethod()
             elif linear_scheme == OnlineQuantScheme.TURBOQUANT:
-                return TurboQuantOnlineLinearMethod()
+                tq_kwargs: dict[str, Any] = {}
+                if self.args.bits is not None:
+                    tq_kwargs["bits"] = self.args.bits
+                if self.args.group_size is not None:
+                    tq_kwargs["group_size"] = self.args.group_size
+                return TurboQuantOnlineLinearMethod(**tq_kwargs)
             elif linear_scheme == OnlineQuantScheme.FP8_PER_BLOCK:
                 return Fp8PerBlockOnlineLinearMethod()
             else:

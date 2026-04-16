@@ -630,6 +630,13 @@ class TurboQuantOnlineLinearMethod(LinearMethodBase):
     uses_meta_device: bool = True
 
     def __init__(self, bits: int = 3, group_size: int = 128):
+        if bits not in (2, 3, 4):
+            raise ValueError(f"turboquant bits must be 2, 3, or 4; got {bits}")
+        if group_size <= 0 or group_size % 8 != 0:
+            raise ValueError(
+                "turboquant group_size must be a positive multiple of 8; "
+                f"got {group_size}"
+            )
         self.bits = bits
         self.group_size = group_size
 
