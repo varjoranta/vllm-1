@@ -26,6 +26,10 @@ class OnlineQuantScheme(Enum):
     # mxfp8, weights scaled in blocks of 1x32 elements (microscaling FP8)
     MXFP8 = "mxfp8"
 
+    # 3-4 bit weight compression via WHT rotation + Lloyd-Max codebook.
+    # ~4x smaller weights, zero calibration data.
+    TURBOQUANT = "turboquant"
+
 
 @config
 class OnlineQuantizationConfigArgs:

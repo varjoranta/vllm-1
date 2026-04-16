@@ -41,6 +41,9 @@ from vllm.model_executor.layers.quantization.online.mxfp8 import (
     Mxfp8OnlineLinearMethod,
     Mxfp8OnlineMoEMethod,
 )
+from vllm.model_executor.layers.quantization.online.turboquant import (
+    TurboQuantOnlineLinearMethod,
+)
 
 logger = init_logger(__name__)
 
@@ -112,6 +115,8 @@ class OnlineQuantizationConfig(QuantizationConfig):
                     "weights. linear layers remain in full precision."
                 )
                 return UnquantizedLinearMethod()
+            elif linear_scheme == OnlineQuantScheme.TURBOQUANT:
+                return TurboQuantOnlineLinearMethod()
             elif linear_scheme == OnlineQuantScheme.FP8_PER_BLOCK:
                 return Fp8PerBlockOnlineLinearMethod()
             elif linear_scheme == OnlineQuantScheme.MXFP8:
@@ -129,6 +134,9 @@ class OnlineQuantizationConfig(QuantizationConfig):
             moe_scheme = self.args.moe_scheme_override or self.args.global_scheme
             if moe_scheme == OnlineQuantScheme.INT8_PER_CHANNEL_WEIGHT_ONLY:
                 return Int8OnlineMoEMethod(layer=layer)
+            elif moe_scheme == OnlineQuantScheme.TURBOQUANT:
+                # TurboQuant MoE not yet supported — keep bf16
+                return UnquantizedFusedMoEMethod(layer.moe_config)
             elif moe_scheme == OnlineQuantScheme.FP8_PER_BLOCK:
                 return Fp8PerBlockOnlineMoEMethod(layer=layer)
             elif moe_scheme == OnlineQuantScheme.MXFP8:
