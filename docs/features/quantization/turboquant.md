@@ -36,7 +36,17 @@ from vllm import LLM
 llm = LLM(model="...", quantization="turboquant")
 ```
 
-Defaults to 3-bit weights with group size 128.
+Defaults to 3-bit weights with group size 128. To pick a different bit width (2, 3, or 4):
+
+```bash
+vllm serve <model> --quantization turboquant --quantization-config '{"bits": 4}'
+```
+
+Or via the Python API:
+
+```python
+llm = LLM(model="...", quantization="turboquant", quantization_config={"bits": 4})
+```
 
 ## What gets quantized
 

@@ -412,3 +412,30 @@ class TestLinearCompression:
         x = torch.randn(2, 8, 128, device="cpu")
         out = method.apply(layer, x, bias=None)
         assert out.shape == (2, 8, 64)
+
+
+class TestTurboQuantConfigValidation:
+    """Constructor rejects bit widths and group sizes the packing code can't handle."""
+
+    @pytest.mark.parametrize("bits", [2, 3, 4])
+    def test_accepts_supported_bits(self, bits):
+        method = TurboQuantOnlineLinearMethod(bits=bits)
+        assert method.bits == bits
+
+    @pytest.mark.parametrize("bits", [0, 1, 5, 8, -1])
+    def test_rejects_unsupported_bits(self, bits):
+        with pytest.raises(ValueError, match=r"turboquant bits must be 2, 3, or 4"):
+            TurboQuantOnlineLinearMethod(bits=bits)
+
+    @pytest.mark.parametrize("group_size", [0, -128, 7, 15, 129])
+    def test_rejects_bad_group_size(self, group_size):
+        with pytest.raises(
+            ValueError, match=r"turboquant group_size must be a positive"
+        ):
+            TurboQuantOnlineLinearMethod(group_size=group_size)
+
+    def test_default_params(self):
+        """Default construction matches the documented defaults."""
+        method = TurboQuantOnlineLinearMethod()
+        assert method.bits == 3
+        assert method.group_size == 128

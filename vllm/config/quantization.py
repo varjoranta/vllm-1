@@ -54,6 +54,16 @@ class OnlineQuantizationConfigArgs:
     patterns with ``re:`` prefix (e.g. ``re:.*attn.*``), consistent with
     compressed_tensors layer skipping."""
 
+    bits: int | None = None
+    """Weight bit width. Only used by schemes that support variable bit
+    widths (``turboquant``: 2, 3, or 4; default 3). Ignored for
+    ``fp8_per_tensor`` and ``fp8_per_block``."""
+
+    group_size: int | None = None
+    """Weight group size for block-scaled schemes. Only used by schemes
+    that support variable group sizes (``turboquant``: default 128).
+    Ignored for ``fp8_per_tensor`` and ``fp8_per_block``."""
+
     @field_validator(
         "global_scheme", "linear_scheme_override", "moe_scheme_override", mode="before"
     )
