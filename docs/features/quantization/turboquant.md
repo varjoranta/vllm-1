@@ -1,12 +1,20 @@
 # TurboQuant (Online 3-4 bit Weight Compression)
 
-TurboQuant is an online weight-only quantization scheme based on [Zandieh et al., ICLR 2026](https://arxiv.org/abs/2503.19878). It compresses BF16 weights to 3 or 4 bits at model load time and requires **no calibration data**.
+`--quantization turboquant` is an online weight-only quantization scheme that compresses BF16 weights to 3 or 4 bits at model load time and requires **no calibration data**.
 
-TurboQuant combines three techniques:
+It combines three techniques:
 
 1. **Walsh–Hadamard randomized rotation** of weight groups. After rotation each coordinate is approximately `N(0, 1/d)`, which lets a small shared codebook work well across all weights.
 2. **Lloyd–Max optimal scalar quantization** at 2/3/4 bits into a 4/8/16-entry codebook.
-3. **Per-group norm correction** — we store `original_norm / reconstruction_norm` (not raw L2 norms), which halves the quantization error at 3 bits in practice.
+3. **Per-group shape-gain decomposition** — we store `original_norm / reconstruction_norm` (the classical shape-gain factor, Gray 1984) rather than raw L2 norms. This halves the 3-bit reconstruction error in practice by accounting for the norm shrinkage introduced by the quantization step itself.
+
+## Background and naming
+
+The algorithm implemented here is the **scalar case of HIGGS** (Malinovskii, Panferov, Ilin, Guo, Richtárik, Alistarh — *Pushing the Limits of Large Language Model Quantization via the Linearity Theorem*, [NAACL 2025](https://aclanthology.org/2025.naacl-long.543/); preprint [arXiv:2411.17525](https://arxiv.org/abs/2411.17525)). HIGGS describes exactly this combination of Random Hadamard Transform pre-processing, MSE-optimal Lloyd–Max grid, and per-group L2 normalization. A reference implementation also exists in [HuggingFace transformers](https://github.com/huggingface/transformers/blob/main/docs/source/en/quantization/higgs.md).
+
+The implementation was originally based on **TurboQuant** ([Zandieh et al., ICLR 2026, arXiv:2504.19874](https://arxiv.org/abs/2504.19874)), which is actually an **online vector quantizer for KV-cache and approximate nearest-neighbour search**, not for static weight compression. Engineering simplifications during development — choosing scalar over vector quantization, WHT over general random rotations, Lloyd–Max over learned grids — converged the weight path onto the HIGGS scalar algorithm. The KV-cache application of TurboQuant is implemented separately in [#38479](https://github.com/vllm-project/vllm/pull/38479) by @vibhavagarwal5.
+
+The `turboquant` name is kept for API and plugin-package compatibility (`--quantization turboquant`, `OnlineQuantScheme.TURBOQUANT`), but **HIGGS is the correct primary citation** for the algorithm in this weight-compression path.
 
 ## When to use TurboQuant
 

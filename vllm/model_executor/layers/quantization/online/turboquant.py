@@ -6,7 +6,15 @@
 Load any BF16 checkpoint, compress weights at startup, serve with
 ~4x smaller GPU memory. Zero calibration data needed.
 
-Based on TurboQuant (Zandieh et al., ICLR 2026).
+Algorithm: scalar case of HIGGS (Malinovskii et al., NAACL 2025,
+aclanthology.org/2025.naacl-long.543; preprint arXiv:2411.17525) —
+Random Hadamard Transform + MSE-optimal Lloyd-Max grid + per-group
+normalization. The implementation was originally based on TurboQuant
+(Zandieh et al., ICLR 2026, arXiv:2504.19874), which targets online
+KV-cache and ANN vector search; engineering simplifications (scalar
+over vector, WHT over general random rotations) converged the weight
+path onto the HIGGS scalar case. The ``turboquant`` name is kept
+for API and plugin-package compatibility.
 
 Usage:
     vllm serve <model> --quantization turboquant
@@ -132,7 +140,10 @@ class _PolarQuant:
         x_unit = x / safe_norms.unsqueeze(1)
         y = self._rotate(x_unit)
         indices = torch.searchsorted(self.boundaries, y.contiguous())
-        # Norm correction: store original_norm / reconstruction_norm
+        # Shape-gain decomposition (classical VQ technique, Gray 1984):
+        # store original_norm / reconstruction_norm instead of raw L2 norm.
+        # Accounts for the reconstruction-norm shrinkage from the quantization
+        # step itself; ~2x lower 3-bit reconstruction error vs raw L2.
         y_hat = self.centroids[indices]
         x_hat_unit = self._rotate_inverse(y_hat)
         recon_norm = torch.linalg.norm(x_hat_unit, dim=1)
