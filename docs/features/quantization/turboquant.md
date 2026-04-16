@@ -42,6 +42,7 @@ Defaults to 3-bit weights with group size 128.
 
 - **Linear layers** — compressed to 3-bit (default) using `TurboQuantOnlineLinearMethod`.
 - **MoE experts** — kept at BF16 in this release. Dispatch falls back to the default unquantized MoE method. MoE support is planned in a follow-up.
+- **Hardware-native FP4 (MXFP4/NVFP4) is out of scope.** The Walsh–Hadamard rotation is applied globally across each weight group, which is fine for per-row scaling but conflicts with per-block scaled formats — a global rotation spreads outlier mass across block boundaries and pollutes the per-block scales. Block-aligned rotation for those formats is a separate PR.
 
 Layers can be excluded via the `ignore` list in the `OnlineQuantizationConfigArgs`:
 
