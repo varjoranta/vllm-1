@@ -723,6 +723,18 @@ class TurboQuantOnlineLinearMethod(LinearMethodBase):
         layer.register_buffer("tq_signs1", quantizer.signs1)
         layer.register_buffer("tq_signs2", quantizer.signs2)
         layer.register_buffer("tq_centroids", quantizer.centroids)
+        # Pre-cast companions consumed only by the bs=1 CUDA GEMV fast path.
+        # Casting once here avoids ~56 MB of per-step HBM traffic on Qwen3-8B.
+        if bits == 3 and group_size == 128:
+            layer.register_buffer(
+                "tq_packed_bs1",
+                packed.view(out_dim * n_groups, 48).contiguous(),
+            )
+            layer.register_buffer("tq_norms_bf16", norms.to(torch.bfloat16).contiguous())
+            layer.register_buffer(
+                "tq_centroids_bf16",
+                quantizer.centroids.to(torch.bfloat16).contiguous(),
+            )
         layer.tq_in_features = in_dim
         layer.tq_out_features = out_dim
         layer.tq_padded_in = padded_in
@@ -745,6 +757,29 @@ class TurboQuantOnlineLinearMethod(LinearMethodBase):
         # Pad input if in_dim was not a multiple of group_size
         if x.shape[-1] != layer.tq_padded_in:
             x = torch.nn.functional.pad(x, (0, layer.tq_padded_in - x.shape[-1]))
+
+        # bs=1 CUDA GEMV fast path (sm_80+, 3-bit, bf16, no bias).
+        # Triton GEMV wastes 15/16 of the tensor-core tile at M=1.
+        if (
+            bias is None
+            and x.dtype == torch.bfloat16
+            and x.numel() == x.shape[-1]
+            and hasattr(layer, "tq_packed_bs1")
+        ):
+            from .turboquant_gemv import maybe_load
+            ext = maybe_load()
+            if ext is not None:
+                x_flat = x.reshape(1, x.shape[-1])
+                x_rot = _rotate_input(
+                    x_flat.float(), layer.tq_signs1, layer.tq_signs2, self.group_size,
+                ).to(torch.bfloat16)
+                out_vec = ext.tq3_gemv_bs1(
+                    x_rot.view(-1),
+                    layer.tq_packed_bs1,
+                    layer.tq_norms_bf16,
+                    layer.tq_centroids_bf16,
+                )
+                return out_vec.view(*x.shape[:-1], layer.tq_out_features)
 
         if layer._tq_primary_fn is not None:
             args = (
