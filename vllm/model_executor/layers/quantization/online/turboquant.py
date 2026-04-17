@@ -335,6 +335,13 @@ if _HAS_TRITON:
                 pb = tl.load(packed_ptr + pe, mask=offs_n[:, None] < N, other=0).to(tl.int32)
                 indices = tl.where(is_hi[None, :] > 0, (pb >> 4) & 0xF, pb & 0xF)
             elif BITS == 3:
+                # Bulk-load all 48 packed bytes per row in one coalesced
+                # transaction (padded to 64 = pow-of-2 for Triton tile
+                # constraint, with the tail 16 masked out). Then gather the
+                # per-k bytes from the in-register buffer. Replaces two
+                # uncoalesced per-thread scatter loads whose stride pattern
+                # (bi0[k]=[0,0,0,1,1,1,2,2,...]) could not be vectorized
+                # by Triton and cost ~50x at bs=1 on real models.
                 g8 = offs_k // 8
                 p8 = offs_k % 8
                 bo = p8 * 3
@@ -342,11 +349,19 @@ if _HAS_TRITON:
                 bib = (bo % 8).to(tl.int32)
                 crosses = bib > 5
                 bi0 = g8 * 3 + fb
-                bi1 = bi0 + 1
-                p0 = packed_row[:, None] * stride_packed_n + bi0[None, :] * stride_packed_k
-                b0 = tl.load(packed_ptr + p0, mask=offs_n[:, None] < N, other=0).to(tl.int32)
-                p1 = packed_row[:, None] * stride_packed_n + bi1[None, :] * stride_packed_k
-                b1 = tl.load(packed_ptr + p1, mask=offs_n[:, None] < N, other=0).to(tl.int32)
+                bi1 = tl.minimum(bi0 + 1, 47)
+                byte_offs = tl.arange(0, 64)
+                valid_byte = byte_offs < 48
+                bulk_p = packed_row[:, None] * stride_packed_n + byte_offs[None, :] * stride_packed_k
+                bulk = tl.load(
+                    packed_ptr + bulk_p,
+                    mask=(offs_n[:, None] < N) & valid_byte[None, :],
+                    other=0,
+                ).to(tl.int32)
+                bi0_bc = tl.broadcast_to(bi0[None, :], (BLOCK_N, GROUP_SIZE))
+                bi1_bc = tl.broadcast_to(bi1[None, :], (BLOCK_N, GROUP_SIZE))
+                b0 = tl.gather(bulk, bi0_bc, axis=1)
+                b1 = tl.gather(bulk, bi1_bc, axis=1)
                 single = (b0 >> bib[None, :]) & 0x7
                 cross = ((b0 >> bib[None, :]) | (b1 << (8 - bib[None, :]))) & 0x7
                 indices = tl.where(crosses[None, :], cross, single)
@@ -425,6 +440,9 @@ if _HAS_TRITON:
                 pk = tl.load(codes_ptr + cp, mask=mask_n[:, None], other=0).to(tl.int32)
                 codes = tl.where(ih[None, :] > 0, (pk >> 4) & 0xF, pk & 0xF)
             elif BITS == 3:
+                # Bulk-load all 48 packed bytes per row in one coalesced
+                # transaction, then gather per-k bytes from the in-register
+                # buffer. See identical fix in _tq_fused_gemm_kernel.
                 g8 = offs_k // 8
                 p8 = offs_k % 8
                 bo = p8 * 3
@@ -432,11 +450,19 @@ if _HAS_TRITON:
                 bib = (bo % 8).to(tl.int32)
                 crosses = bib > 5
                 bi0 = g8 * 3 + fb
-                bi1 = bi0 + 1
-                p0 = packed_row[:, None] * stride_cn + bi0[None, :] * stride_ck
-                b0 = tl.load(codes_ptr + p0, mask=mask_n[:, None], other=0).to(tl.int32)
-                p1 = packed_row[:, None] * stride_cn + bi1[None, :] * stride_ck
-                b1 = tl.load(codes_ptr + p1, mask=mask_n[:, None], other=0).to(tl.int32)
+                bi1 = tl.minimum(bi0 + 1, 47)
+                byte_offs = tl.arange(0, 64)
+                valid_byte = byte_offs < 48
+                bulk_p = packed_row[:, None] * stride_cn + byte_offs[None, :] * stride_ck
+                bulk = tl.load(
+                    codes_ptr + bulk_p,
+                    mask=mask_n[:, None] & valid_byte[None, :],
+                    other=0,
+                ).to(tl.int32)
+                bi0_bc = tl.broadcast_to(bi0[None, :], (BLOCK_N, BLOCK_K))
+                bi1_bc = tl.broadcast_to(bi1[None, :], (BLOCK_N, BLOCK_K))
+                b0 = tl.gather(bulk, bi0_bc, axis=1)
+                b1 = tl.gather(bulk, bi1_bc, axis=1)
                 single = (b0 >> bib[None, :]) & 0x7
                 cross = ((b0 >> bib[None, :]) | (b1 << (8 - bib[None, :]))) & 0x7
                 codes = tl.where(crosses[None, :], cross, single)
