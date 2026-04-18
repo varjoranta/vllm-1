@@ -621,6 +621,45 @@ try:
         N = norms.shape[0]
         return x.new_empty((*x.shape[:-1], N))
 
+    # TQ3 linear op with runtime-internal M-based dispatch.
+    # Wrapped as a single custom op so Dynamo treats it as opaque: vLLM's
+    # compile traces the model once on profile_run (batch >> 1) and would
+    # specialize any Python-level M==1 branch against that. Pushing the
+    # branch inside an opaque op lets each CUDA-graph capture size run the
+    # right path (M==1 -> CUDA GEMV; M>1 -> Triton fused GEMM).
+    @torch.library.custom_op(
+        "turboquant::tq3_apply", mutates_args=(), device_types=("cuda",),
+    )
+    def _tq3_apply_op(
+        x: torch.Tensor,
+        packed_weight: torch.Tensor, norms: torch.Tensor,
+        signs1: torch.Tensor, signs2: torch.Tensor, centroids: torch.Tensor,
+        packed_bs1: torch.Tensor, norms_bf16: torch.Tensor,
+        centroids_bf16: torch.Tensor,
+        group_size: int, bits: int,
+    ) -> torch.Tensor:
+        if x.dim() == 2 and x.shape[0] == 1 and bits == 3:
+            from .turboquant_gemv import maybe_load
+            ext = maybe_load()
+            if ext is not None:
+                x_rot = _rotate_input(
+                    x.float(), signs1, signs2, group_size,
+                ).to(torch.bfloat16)
+                out = ext.tq3_gemv_bs1(
+                    x_rot.view(-1), packed_bs1, norms_bf16, centroids_bf16,
+                )
+                return out.view(1, -1)
+        return _tq_fwht_input_gemm_launcher(
+            x, packed_weight, norms, signs1, signs2, centroids,
+            group_size=group_size, bits=bits, bias=None,
+        )
+
+    @_tq3_apply_op.register_fake
+    def _(x, packed_weight, norms, signs1, signs2, centroids,
+          packed_bs1, norms_bf16, centroids_bf16, group_size, bits):
+        N = norms.shape[0]
+        return x.new_empty((*x.shape[:-1], N))
+
     def tq_fused_gemm(x, packed_weight, norms, signs1, signs2, centroids,
                       group_size=128, bits=4, bias=None):
         return torch.ops.turboquant.tq_fused_gemm(
@@ -758,28 +797,23 @@ class TurboQuantOnlineLinearMethod(LinearMethodBase):
         if x.shape[-1] != layer.tq_padded_in:
             x = torch.nn.functional.pad(x, (0, layer.tq_padded_in - x.shape[-1]))
 
-        # bs=1 CUDA GEMV fast path (sm_80+, 3-bit, bf16, no bias).
-        # Triton GEMV wastes 15/16 of the tensor-core tile at M=1.
+        # Route TQ3 bf16 through the runtime-dispatching custom op so the
+        # bs=1 CUDA GEMV can be captured inside each size-specific CUDA
+        # graph without Dynamo specializing the M-branch against profile_run.
         if (
             bias is None
             and x.dtype == torch.bfloat16
-            and x.numel() == x.shape[-1]
             and hasattr(layer, "tq_packed_bs1")
+            and self.bits == 3
         ):
-            from .turboquant_gemv import maybe_load
-            ext = maybe_load()
-            if ext is not None:
-                x_flat = x.reshape(1, x.shape[-1])
-                x_rot = _rotate_input(
-                    x_flat.float(), layer.tq_signs1, layer.tq_signs2, self.group_size,
-                ).to(torch.bfloat16)
-                out_vec = ext.tq3_gemv_bs1(
-                    x_rot.view(-1),
-                    layer.tq_packed_bs1,
-                    layer.tq_norms_bf16,
-                    layer.tq_centroids_bf16,
-                )
-                return out_vec.view(*x.shape[:-1], layer.tq_out_features)
+            return torch.ops.turboquant.tq3_apply(
+                x,
+                layer.tq_packed_weight, layer.tq_norms,
+                layer.tq_signs1, layer.tq_signs2, layer.tq_centroids,
+                layer.tq_packed_bs1, layer.tq_norms_bf16,
+                layer.tq_centroids_bf16,
+                self.group_size, self.bits,
+            )
 
         if layer._tq_primary_fn is not None:
             args = (
