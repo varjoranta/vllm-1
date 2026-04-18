@@ -126,6 +126,7 @@ __global__ void tq3_gemv_bs1_kernel(
     __nv_bfloat16*       __restrict__ out,
     int K, int OC, int n_groups)
 {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
     const int oc  = blockIdx.x;
     const int tid = threadIdx.x;
     if (oc >= OC) return;
@@ -168,6 +169,7 @@ __global__ void tq3_gemv_bs1_kernel(
     if (tid == 0) {
         out[oc] = __float2bfloat16(psum);
     }
+#endif  // __CUDA_ARCH__ >= 800
 }
 
 torch::Tensor tq3_gemv_bs1(
