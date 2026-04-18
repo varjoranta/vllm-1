@@ -23,10 +23,34 @@ Usage:
 from __future__ import annotations
 
 import math
+import os
 from typing import Any
 
 import torch
 import torch.nn as nn
+
+try:
+    import flute
+    import flute.integrations.higgs as _flute_higgs
+    import flute.utils as _flute_utils
+
+    _HAS_FLUTE = True
+except ImportError:
+    _HAS_FLUTE = False
+
+# Optional FLUTE fast path. FLUTE (Guo et al. EMNLP Findings 2024,
+# github.com/HanGuo97/flute) is the canonical scalar-HIGGS inference
+# kernel — tensor-core fused dequant-GEMM with cp.async pipelining.
+# Used by HuggingFace transformers' HIGGS integration.
+#
+# When ``flute-kernel`` is importable and the layer shape matches
+# FLUTE's supported configuration (bits=3, group_size=128, fp16/bf16),
+# we route the dequant + matmul through ``flute.qgemm_simple``. Our
+# ``_rotate_input`` (signed WHT) stays external, so quantization
+# numerics match the Triton path exactly.
+#
+# Disable with ``VLLM_TURBOQUANT_USE_FLUTE=0`` for A/B benchmarking.
+_USE_FLUTE = _HAS_FLUTE and os.environ.get("VLLM_TURBOQUANT_USE_FLUTE", "1") != "0"
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearMethodBase
@@ -680,6 +704,98 @@ except (AttributeError, RuntimeError, NameError):
 
 
 # ---------------------------------------------------------------------------
+# FLUTE fast path — optional
+# ---------------------------------------------------------------------------
+
+
+def _prepare_flute_tensors(
+    packed_weight: torch.Tensor,  # our packed uint8, shape (out_dim, pack_cols)
+    norms: torch.Tensor,          # shape (out_dim, n_groups), fp32 or bf16
+    centroids: torch.Tensor,      # shape (2^bits,), fp32 or bf16
+    out_dim: int,
+    in_dim: int,
+    bits: int,
+    group_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Convert our TQ tensors to FLUTE's format via integrations.higgs.
+
+    Returns a dict of FLUTE tensors: flute_weight, flute_scales,
+    flute_tables, flute_tables2, flute_workspace, plus template_id +
+    num_sms captured in flute_template_id / flute_num_sms for runtime.
+    """
+    # Unpack our packed uint8 to plain uint8 indices [out_dim, in_dim].
+    # FLUTE's prepare_data_transposed expects weight_original as uint8.
+    indices = _unpack_indices(packed_weight, bits, in_dim).to(torch.uint8).contiguous()
+
+    # Grid: Lloyd-Max centroids as [2^bits, 1] for vector_size=1.
+    grid = centroids.to(dtype=dtype, device=device).reshape(-1, 1).contiguous()
+
+    # Scales: our norms are [out_dim, n_groups], which matches
+    # prepare_data_transposed's scales_original shape [dim0, dim1/group_size].
+    scales = norms.to(dtype=dtype, device=device).contiguous()
+
+    weight_flute, scales_flute, tables, tables2, tune_metadata = (
+        _flute_higgs.prepare_data_transposed(
+            weight_original=indices,
+            scales_original=scales,
+            grid=grid,
+            num_bits=bits,
+            group_size=group_size,
+            vector_size=1,
+            dtype=dtype,
+            device=device,
+            check_correctness=False,
+        )
+    )
+
+    workspace = _flute_utils.get_workspace_streamk(device)
+
+    return {
+        "flute_weight": weight_flute,
+        "flute_scales": scales_flute,
+        "flute_tables": tables,
+        "flute_tables2": tables2,
+        "flute_workspace": workspace,
+        "flute_template_id": int(tune_metadata.template_id),
+        "flute_num_sms": int(tune_metadata.num_sms),
+    }
+
+
+def _flute_apply(
+    layer: nn.Module,
+    x_rot: torch.Tensor,
+    bias: torch.Tensor | None,
+    bits: int,
+    group_size: int,
+) -> torch.Tensor:
+    """Call flute.qgemm_simple with the pre-rotated input. Returns y in
+    x_rot's dtype. Our signed WHT rotation must already be baked into
+    x_rot by the caller."""
+    orig_dtype = x_rot.dtype
+    # FLUTE expects fp16 or bf16 for the activation; match the tables dtype.
+    tables_dtype = layer.flute_tables.dtype
+    if x_rot.dtype != tables_dtype:
+        x_rot = x_rot.to(tables_dtype)
+    output = flute.qgemm_simple(
+        x_rot,
+        layer.flute_weight,
+        layer.flute_scales,
+        layer.flute_tables,
+        layer.flute_tables2,
+        layer.flute_workspace,
+        bits,
+        group_size,
+    )
+    if bias is not None:
+        output.add_(bias.to(output.dtype))
+    if output.dtype != orig_dtype:
+        output = output.to(orig_dtype)
+    return output
+
+
+# ---------------------------------------------------------------------------
 # TurboQuantOnlineLinearMethod
 # ---------------------------------------------------------------------------
 
@@ -784,6 +900,45 @@ class TurboQuantOnlineLinearMethod(LinearMethodBase):
         else:
             layer._tq_primary_fn = None
 
+        # Optional FLUTE fast path — register tensors alongside our native
+        # ones so apply() can branch per-call. Only the shapes FLUTE has
+        # tuned templates for (bits=3 g=128, bits=4 g=128, bits=2 g=128)
+        # get the FLUTE path; other shapes stay on the Triton dispatch.
+        layer._has_flute = False
+        if (
+            _USE_FLUTE
+            and bits in (2, 3, 4)
+            and group_size == 128
+            and weight.device.type == "cuda"
+        ):
+            try:
+                flute_dtype = (
+                    torch.bfloat16 if weight.dtype == torch.bfloat16 else torch.float16
+                )
+                flute_tensors = _prepare_flute_tensors(
+                    packed_weight=packed,
+                    norms=norms,
+                    centroids=quantizer.centroids,
+                    out_dim=out_dim,
+                    in_dim=padded_in,
+                    bits=bits,
+                    group_size=group_size,
+                    dtype=flute_dtype,
+                    device=weight.device,
+                )
+            except (RuntimeError, ValueError, TypeError) as exc:
+                logger.warning_once(
+                    "FLUTE fast-path setup failed (%s); falling back to Triton.",
+                    exc,
+                )
+            else:
+                for name, tensor in flute_tensors.items():
+                    if isinstance(tensor, torch.Tensor):
+                        layer.register_buffer(name, tensor)
+                    else:
+                        setattr(layer, name, tensor)
+                layer._has_flute = True
+
         layer._already_called_process_weights_after_loading = True
         del weight, padded, grouped, indices, norms_raw
 
@@ -796,6 +951,20 @@ class TurboQuantOnlineLinearMethod(LinearMethodBase):
         # Pad input if in_dim was not a multiple of group_size
         if x.shape[-1] != layer.tq_padded_in:
             x = torch.nn.functional.pad(x, (0, layer.tq_padded_in - x.shape[-1]))
+
+        # FLUTE fast path. Applies our signed WHT rotation to the input
+        # (keeps quantization numerics identical to the Triton path),
+        # then routes dequant + matmul through flute.qgemm_simple.
+        if (
+            getattr(layer, "_has_flute", False)
+            and x.dtype in (torch.float16, torch.bfloat16)
+        ):
+            batch_shape = x.shape[:-1]
+            K = x.shape[-1]
+            x_flat = x.reshape(-1, K)
+            x_rot = _rotate_input(x_flat, layer.tq_signs1, layer.tq_signs2, self.group_size)
+            y = _flute_apply(layer, x_rot, bias, self.bits, self.group_size)
+            return y.reshape(*batch_shape, y.shape[-1])
 
         # Route TQ3 bf16 through the runtime-dispatching custom op so the
         # bs=1 CUDA GEMV can be captured inside each size-specific CUDA
