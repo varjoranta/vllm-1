@@ -61,7 +61,7 @@ def _fast_wht_batch(x: torch.Tensor) -> torch.Tensor:
         x_view[:, :, 0, :] = a + b
         x_view[:, :, 1, :] = a - b
         h *= 2
-    return x / math.sqrt(n)
+    return x.div_(math.sqrt(n))
 
 
 
@@ -121,12 +121,14 @@ class _PolarQuant:
         return padded[:, : self.dim]
 
     def _rotate_inverse(self, y: torch.Tensor) -> torch.Tensor:
+        """Apply inverse rotation. NOTE: mutates `y` in place — pass a
+        fresh tensor (centroid lookups already allocate new storage)."""
         batch = y.shape[0]
         if self.padded_dim > self.dim:
             padded = torch.zeros(batch, self.padded_dim, device=y.device, dtype=y.dtype)
             padded[:, : self.dim] = y
         else:
-            padded = y.clone()
+            padded = y
         padded *= self.signs2.unsqueeze(0)
         padded = _fast_wht_batch(padded)
         padded *= self.signs1.unsqueeze(0)
@@ -153,11 +155,15 @@ class _PolarQuant:
 
     def dequantize(self, indices: torch.Tensor, norms: torch.Tensor) -> torch.Tensor:
         """Dequantize. indices: (n_groups, group_size). Returns (n_groups, group_size)."""
-        indices = indices.to(device=self.device)
-        norms = norms.to(device=self.device, dtype=torch.float32)
+        if indices.device != self.device:
+            indices = indices.to(device=self.device)
+        # `norms` is already fp32 from quantize; avoid a redundant alloc.
+        if norms.dtype != torch.float32 or norms.device != self.device:
+            norms = norms.to(device=self.device, dtype=torch.float32)
         y_hat = self.centroids[indices]
         x_hat_unit = self._rotate_inverse(y_hat)
-        return x_hat_unit * norms.unsqueeze(1)
+        x_hat_unit.mul_(norms.unsqueeze(1))
+        return x_hat_unit
 
 
 # ---------------------------------------------------------------------------
@@ -225,40 +231,43 @@ def _pack_indices(indices: torch.Tensor, bits: int) -> torch.Tensor:
 
 
 def _unpack_indices(packed: torch.Tensor, bits: int, dim: int) -> torch.Tensor:
-    """Unpack uint8 packed indices back to int64."""
+    """Unpack uint8 packed indices back to int32.
+
+    int32 (vs int64) halves the hot-path memory spike in MoE decompress.
+    Downstream consumers (``centroids[indices]``, Triton kernels) all
+    accept any integer dtype.
+    """
     if bits == 4:
         flat = packed.reshape(-1, packed.shape[-1])
-        lo = (flat & 0x0F).to(torch.int64)
-        hi = ((flat >> 4) & 0x0F).to(torch.int64)
-        unpacked = torch.zeros(flat.shape[0], flat.shape[1] * 2, dtype=torch.int64, device=packed.device)
-        unpacked[:, 0::2] = lo
-        unpacked[:, 1::2] = hi
-        return unpacked.reshape(packed.shape[0], -1)[:, :dim]
+        n_rows, n_cols = flat.shape
+        unpacked = torch.empty(n_rows, n_cols * 2, dtype=torch.int32, device=packed.device)
+        unpacked[:, 0::2] = (flat & 0x0F).to(torch.int32)
+        unpacked[:, 1::2] = ((flat >> 4) & 0x0F).to(torch.int32)
+        return unpacked[:, :dim]
     elif bits == 3:
         flat = packed.reshape(-1, packed.shape[-1])
-        n_rows = flat.shape[0]
-        n_groups_of_3 = flat.shape[1] // 3
-        unpacked = torch.zeros(n_rows, n_groups_of_3 * 8, dtype=torch.int64, device=packed.device)
-        for i in range(n_groups_of_3):
-            b0 = flat[:, i * 3].to(torch.int64)
-            b1 = flat[:, i * 3 + 1].to(torch.int64)
-            b2 = flat[:, i * 3 + 2].to(torch.int64)
-            unpacked[:, i * 8 + 0] = b0 & 0x7
-            unpacked[:, i * 8 + 1] = (b0 >> 3) & 0x7
-            unpacked[:, i * 8 + 2] = ((b0 >> 6) | (b1 << 2)) & 0x7
-            unpacked[:, i * 8 + 3] = (b1 >> 1) & 0x7
-            unpacked[:, i * 8 + 4] = (b1 >> 4) & 0x7
-            unpacked[:, i * 8 + 5] = ((b1 >> 7) | (b2 << 1)) & 0x7
-            unpacked[:, i * 8 + 6] = (b2 >> 2) & 0x7
-            unpacked[:, i * 8 + 7] = (b2 >> 5) & 0x7
-        return unpacked[:, :dim]
+        n_rows, n_cols = flat.shape
+        n_groups_of_3 = n_cols // 3
+        g3 = flat[:, : n_groups_of_3 * 3].reshape(n_rows, n_groups_of_3, 3).to(torch.int32)
+        b0, b1, b2 = g3[..., 0], g3[..., 1], g3[..., 2]
+        out = torch.empty(n_rows, n_groups_of_3, 8, dtype=torch.int32, device=packed.device)
+        out[..., 0] = b0 & 0x7
+        out[..., 1] = (b0 >> 3) & 0x7
+        out[..., 2] = ((b0 >> 6) | (b1 << 2)) & 0x7
+        out[..., 3] = (b1 >> 1) & 0x7
+        out[..., 4] = (b1 >> 4) & 0x7
+        out[..., 5] = ((b1 >> 7) | (b2 << 1)) & 0x7
+        out[..., 6] = (b2 >> 2) & 0x7
+        out[..., 7] = (b2 >> 5) & 0x7
+        return out.reshape(n_rows, n_groups_of_3 * 8)[:, :dim]
     elif bits == 2:
         flat = packed.reshape(-1, packed.shape[-1])
-        unpacked = torch.zeros(flat.shape[0], flat.shape[1] * 4, dtype=torch.int64, device=packed.device)
+        n_rows, n_cols = flat.shape
+        unpacked = torch.empty(n_rows, n_cols * 4, dtype=torch.int32, device=packed.device)
         for i in range(4):
-            unpacked[:, i::4] = ((flat >> (i * 2)) & 0x03).to(torch.int64)
-        return unpacked.reshape(packed.shape[0], -1)[:, :dim]
-    return packed.to(torch.int64)
+            unpacked[:, i::4] = ((flat >> (i * 2)) & 0x03).to(torch.int32)
+        return unpacked[:, :dim]
+    return packed.to(torch.int32)
 
 
 # ---------------------------------------------------------------------------

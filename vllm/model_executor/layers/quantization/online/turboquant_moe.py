@@ -10,7 +10,7 @@ production on GLM-5.1 754B and Gemma 4 26B): compress each expert's
 w13 and w2 via the same PolarQuant pipeline used for Linear layers,
 share a single bf16 scratch pool across all MoE layers (only one runs
 at a time during forward), decompress into the pool per-forward and
-delegate to the existing ``UnquantizedFusedMoEMethod`` kernel.
+delegate to the existing unquantized MoE kernel.
 
 Trade-offs vs a fused-dequant MoE kernel:
 
@@ -32,6 +32,15 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.logger import init_logger
+from vllm.model_executor.layers.fused_moe.config import (
+    FUSED_MOE_UNQUANTIZED_CONFIG,
+    biased_moe_quant_config,
+)
+from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+    convert_to_unquantized_kernel_format,
+    make_unquantized_moe_kernel,
+    select_unquantized_moe_backend,
+)
 from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
@@ -40,9 +49,11 @@ from vllm.model_executor.layers.quantization.online.turboquant import (
     _get_quantizer,
     _unpack_indices,
 )
+from vllm.model_executor.utils import replace_parameter
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe import FusedMoE
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
 
 logger = init_logger(__name__)
 
@@ -56,21 +67,21 @@ class _Compressed3D:
     """
 
     __slots__ = (
-        "packed", "norms", "shape", "dtype", "bits", "group_size",
-        "padded_in", "n_groups",
+        "packed", "norms_flat", "shape", "dtype", "bits", "group_size", "padded_in",
     )
 
     def __init__(self, data: torch.Tensor, bits: int, group_size: int):
-        n_experts, out_dim, in_dim = data.shape
         self.shape = data.shape
         self.dtype = data.dtype
         self.bits = bits
         self.group_size = group_size
 
-        flat = data.reshape(-1, in_dim)
-        self.packed, self.norms, self.padded_in, self.n_groups = _compress_2d(
-            flat, bits, group_size,
-        )
+        flat = data.reshape(-1, data.shape[-1])
+        packed, norms, self.padded_in, _ = _compress_2d(flat, bits, group_size)
+        self.packed = packed
+        # Keep the flat view the hot path actually consumes, not the
+        # (rows, n_groups) shape — one fewer view per forward.
+        self.norms_flat = norms.reshape(-1)
 
     def decompress_into(self, out: torch.Tensor) -> None:
         """Write decompressed bf16/fp16 weights into a pre-allocated buffer.
@@ -80,60 +91,57 @@ class _Compressed3D:
         plugin's csrc/. A Phase 2 PR replaces this with a direct CUDA
         dequant matching the Linear path's speed.
         """
-        assert out.shape == self.shape, (
-            f"decompress_into expected shape {self.shape}, got {tuple(out.shape)}"
-        )
-        assert out.dtype == self.dtype, (
-            f"decompress_into expected dtype {self.dtype}, got {out.dtype}"
-        )
-
         n_experts, out_dim, in_dim = self.shape
         quantizer = _get_quantizer(self.group_size, self.bits, str(out.device))
-
         indices = _unpack_indices(self.packed, self.bits, self.padded_in)
-        grouped_indices = indices.reshape(-1, self.group_size)
-        grouped_norms = self.norms.reshape(-1)
-        dequant = quantizer.dequantize(grouped_indices, grouped_norms)
+        dequant = quantizer.dequantize(
+            indices.reshape(-1, self.group_size), self.norms_flat,
+        )
         dequant = dequant.reshape(n_experts, out_dim, self.padded_in)
-        if self.padded_in > in_dim:
-            dequant = dequant[:, :, :in_dim]
-        out.copy_(dequant.to(out.dtype))
+        out.copy_(dequant[:, :, :in_dim])
+
+
+# Module-level singleton. Only one MoE layer runs at a time during forward,
+# so one (w13, w2) scratch pair is enough across every MoE layer in the
+# loaded model. Multi-model processes (speculative draft + target, LoRA
+# routers) will share this pool; if they load models with mismatched MoE
+# shapes, the second load raises via ``_assert_shape_matches``.
+# TODO: key by VllmConfig once that has a clean lifetime handle, so
+# multi-model serving gets independent pools.
+_MOE_SCRATCH_POOL: "_MoEScratchPool | None" = None
 
 
 class _MoEScratchPool:
-    """One bf16 scratch buffer pair shared across all MoE layers.
-
-    Only one MoE layer runs at a time during forward, so a single set
-    of (w13, w2) bf16 tensors is enough. Per-layer scratch would
-    multiply memory by the layer count and defeat the compression.
-    """
-
-    __slots__ = ("w13", "w2", "shape_w13", "shape_w2")
+    __slots__ = ("w13", "w2")
 
     def __init__(self, w13_shape: torch.Size, w2_shape: torch.Size,
                  dtype: torch.dtype, device: torch.device):
-        self.shape_w13 = w13_shape
-        self.shape_w2 = w2_shape
-        self.w13 = torch.zeros(w13_shape, dtype=dtype, device=device)
-        self.w2 = torch.zeros(w2_shape, dtype=dtype, device=device)
+        self.w13 = torch.empty(w13_shape, dtype=dtype, device=device)
+        self.w2 = torch.empty(w2_shape, dtype=dtype, device=device)
 
     def assert_matches(self, w13_shape: torch.Size, w2_shape: torch.Size) -> None:
-        if w13_shape != self.shape_w13:
-            raise AssertionError(
-                f"heterogeneous FusedMoE layer: scratch pool sized "
-                f"{tuple(self.shape_w13)} but layer needs {tuple(w13_shape)}"
+        if self.w13.shape != w13_shape:
+            raise ValueError(
+                f"turboquant MoE scratch pool shape mismatch: pool is "
+                f"{tuple(self.w13.shape)} but layer needs {tuple(w13_shape)}"
             )
-        if w2_shape != self.shape_w2:
-            raise AssertionError(
-                f"heterogeneous FusedMoE layer: scratch pool sized "
-                f"{tuple(self.shape_w2)} but layer needs {tuple(w2_shape)}"
+        if self.w2.shape != w2_shape:
+            raise ValueError(
+                f"turboquant MoE scratch pool shape mismatch: pool is "
+                f"{tuple(self.w2.shape)} but layer needs {tuple(w2_shape)}"
             )
 
 
-# Module-level singleton. TODO(phase-2): move to per-model-config scope
-# so multi-model-per-process cases (speculative draft models, LoRA
-# routers) don't share a pool sized for the first-loaded model.
-_MOE_SCRATCH_POOL: _MoEScratchPool | None = None
+def _get_or_create_pool(
+    w13_shape: torch.Size, w2_shape: torch.Size,
+    dtype: torch.dtype, device: torch.device,
+) -> _MoEScratchPool:
+    global _MOE_SCRATCH_POOL
+    if _MOE_SCRATCH_POOL is None:
+        _MOE_SCRATCH_POOL = _MoEScratchPool(w13_shape, w2_shape, dtype, device)
+    else:
+        _MOE_SCRATCH_POOL.assert_matches(w13_shape, w2_shape)
+    return _MOE_SCRATCH_POOL
 
 
 class TurboQuantOnlineFusedMoEMethod(OnlineMoEMethodBase):
@@ -142,7 +150,7 @@ class TurboQuantOnlineFusedMoEMethod(OnlineMoEMethodBase):
     Allocates fp16/bf16 weights on meta device (zero GPU at init), waits
     for weight-loading to materialize them, then compresses w13 and w2
     in ``process_weights_after_loading``. Forward pass decompresses into
-    the shared scratch pool and delegates to the unquantized kernel.
+    the shared scratch pool and delegates to the unquantized MoE kernel.
     """
 
     uses_meta_device: bool = True
@@ -163,19 +171,21 @@ class TurboQuantOnlineFusedMoEMethod(OnlineMoEMethodBase):
         super().__init__(layer.moe_config)
         self.bits = bits
         self.group_size = group_size
-
-        # Delegation over inheritance for apply(): hold an
-        # UnquantizedFusedMoEMethod and call its apply() after we've
-        # populated the scratch pool. We still inherit OnlineMoEMethodBase
-        # for its create_weights + initialize_online_processing setup,
-        # but override apply() to insert the dequant step.
-        from vllm.model_executor.layers.fused_moe import (
-            UnquantizedFusedMoEMethod,
+        # Mirror Fp8/Int8 online MoE: select backend now, build kernel in
+        # process_weights_after_loading. OnlineMoEMethodBase.apply then
+        # reads self.moe_kernel / layer.w13_weight / layer.w2_weight.
+        self.unquantized_backend, self.experts_cls = select_unquantized_moe_backend(
+            moe_config=self.moe,
         )
-        self._base_method = UnquantizedFusedMoEMethod(layer.moe_config)
+
+    def get_fused_moe_quant_config(
+        self, layer: torch.nn.Module,
+    ) -> "FusedMoEQuantConfig":
+        if self.moe.has_bias:
+            return biased_moe_quant_config(layer.w13_bias, layer.w2_bias)
+        return FUSED_MOE_UNQUANTIZED_CONFIG
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        global _MOE_SCRATCH_POOL
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
@@ -185,25 +195,49 @@ class TurboQuantOnlineFusedMoEMethod(OnlineMoEMethodBase):
         w13_c = _Compressed3D(w13, self.bits, self.group_size)
         w2_c = _Compressed3D(w2, self.bits, self.group_size)
 
-        if _MOE_SCRATCH_POOL is None:
-            _MOE_SCRATCH_POOL = _MoEScratchPool(
-                w13_shape=w13_c.shape, w2_shape=w2_c.shape,
-                dtype=w13.dtype, device=w13.device,
-            )
-        else:
-            _MOE_SCRATCH_POOL.assert_matches(w13_c.shape, w2_c.shape)
+        pool = _get_or_create_pool(w13.shape, w2.shape, w13.dtype, w13.device)
 
-        # Re-point layer's weight parameters at the pool buffers so the
-        # unquantized kernel (which reads layer.w13_weight / w2_weight)
-        # sees freshly-dequantized values on each forward.
-        layer.w13_weight.data = _MOE_SCRATCH_POOL.w13
-        layer.w2_weight.data = _MOE_SCRATCH_POOL.w2
+        # ``convert_to_unquantized_kernel_format`` calls ``.contiguous()``
+        # on the plain-CUDA backend — a storage-preserving no-op on our
+        # already-contiguous pool buffers. Backends that permute weights
+        # (FlashInfer, AITER) would break the pool invariant; guard below.
+        w13_k, w2_k = convert_to_unquantized_kernel_format(
+            self.unquantized_backend, layer=layer,
+            w13_weight=pool.w13, w2_weight=pool.w2,
+        )
+        if w13_k.data_ptr() != pool.w13.data_ptr() or w2_k.data_ptr() != pool.w2.data_ptr():
+            raise ValueError(
+                f"turboquant MoE does not yet support the "
+                f"{self.unquantized_backend.name} backend "
+                "(it permutes weight storage during setup)"
+            )
+
+        # Re-register layer weights onto the pool buffers so the
+        # unquantized kernel reads from the pool on each forward.
+        replace_parameter(layer, "w13_weight", w13_k)
+        replace_parameter(layer, "w2_weight", w2_k)
+
+        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+        assert self.experts_cls is not None
+        self.moe_kernel = make_unquantized_moe_kernel(
+            quant_config=self.moe_quant_config,
+            moe_config=self.moe,
+            backend=self.unquantized_backend,
+            experts_cls=self.experts_cls,
+            routing_tables=layer._maybe_init_expert_routing_tables(),
+            shared_experts=layer.shared_experts,
+        )
 
         layer._tq_w13_compressed = w13_c
         layer._tq_w2_compressed = w2_c
-        layer._tq_scratch_pool = _MOE_SCRATCH_POOL
+        layer._tq_scratch_pool = pool
 
         layer._already_called_process_weights_after_loading = True
+
+    def _dequant_into_pool(self, layer: torch.nn.Module) -> None:
+        pool = layer._tq_scratch_pool
+        layer._tq_w13_compressed.decompress_into(pool.w13)
+        layer._tq_w2_compressed.decompress_into(pool.w2)
 
     def apply(
         self,
@@ -213,14 +247,22 @@ class TurboQuantOnlineFusedMoEMethod(OnlineMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        pool = layer._tq_scratch_pool
-        layer._tq_w13_compressed.decompress_into(pool.w13)
-        layer._tq_w2_compressed.decompress_into(pool.w2)
-
-        return self._base_method.apply(
+        self._dequant_into_pool(layer)
+        return super().apply(
             layer=layer,
             x=x,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             shared_experts_input=shared_experts_input,
+        )
+
+    def apply_monolithic(
+        self,
+        layer: "FusedMoE",  # noqa: F821
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        self._dequant_into_pool(layer)
+        return super().apply_monolithic(
+            layer=layer, x=x, router_logits=router_logits,
         )
