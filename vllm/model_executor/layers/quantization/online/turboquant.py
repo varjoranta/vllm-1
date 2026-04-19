@@ -171,6 +171,30 @@ def _padded_size(dim: int, group_size: int) -> tuple[int, int]:
     return padded, padded // group_size
 
 
+def _compress_2d(
+    flat: torch.Tensor, bits: int, group_size: int
+) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+    """Compress a 2D (rows, in_dim) tensor via PolarQuant + bit-packing.
+
+    Shared between the Linear and MoE paths. Returns
+    (packed, norms_per_row, padded_in, n_groups) where:
+      - packed is uint8, shape (rows, packed_cols) for the given bits
+      - norms_per_row has shape (rows, n_groups)
+      - padded_in is the group-aligned in_dim
+    """
+    rows, in_dim = flat.shape
+    padded_in, n_groups = _padded_size(in_dim, group_size)
+    if padded_in > in_dim:
+        flat = torch.nn.functional.pad(flat, (0, padded_in - in_dim))
+
+    grouped = flat.reshape(-1, group_size)
+    quantizer = _get_quantizer(group_size, bits, str(flat.device))
+    indices, norms_raw = quantizer.quantize(grouped)
+    packed = _pack_indices(indices, bits)
+    norms = norms_raw.reshape(rows, n_groups)
+    return packed, norms, padded_in, n_groups
+
+
 def _pack_indices(indices: torch.Tensor, bits: int) -> torch.Tensor:
     """Pack quantization indices into uint8."""
     if bits == 4:
@@ -702,19 +726,8 @@ class TurboQuantOnlineLinearMethod(LinearMethodBase):
         group_size = self.group_size
 
         out_dim, in_dim = weight.shape
-        padded_in, n_groups = _padded_size(in_dim, group_size)
-
-        if padded_in > in_dim:
-            padded = torch.zeros(out_dim, padded_in, dtype=weight.dtype, device=weight.device)
-            padded[:, :in_dim] = weight
-        else:
-            padded = weight
-
-        grouped = padded.reshape(-1, group_size)
+        packed, norms, padded_in, n_groups = _compress_2d(weight, bits, group_size)
         quantizer = _get_quantizer(group_size, bits, str(weight.device))
-        indices, norms_raw = quantizer.quantize(grouped)
-        packed = _pack_indices(indices, bits)
-        norms = norms_raw.reshape(out_dim, n_groups)
 
         # Keep weight attr for vLLM's MLA post-processing (expects it to exist)
         layer.weight.data = torch.empty(0, device=weight.device, dtype=weight.dtype)
@@ -734,7 +747,7 @@ class TurboQuantOnlineLinearMethod(LinearMethodBase):
             layer._tq_primary_fn = None
 
         layer._already_called_process_weights_after_loading = True
-        del weight, padded, grouped, indices, norms_raw
+        del weight
 
     def apply(
         self,

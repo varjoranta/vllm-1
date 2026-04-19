@@ -6,41 +6,28 @@ Follow-up to PR #39970 which covers Linear-only. This module extends
 ``--quantization turboquant`` to FusedMoE layers.
 
 Strategy (borrowed from the turboquant-plus-vllm plugin, proven in
-production for GLM-5.1 754B on 2xH200 and Gemma 4 26B on L40S):
-
-  1. At weight-load time, compress each expert's w13 and w2 into packed
-     3-bit/4-bit indices + per-group norms via the same PolarQuant pipeline
-     used for Linear layers. Weights go from (n_experts, out, in) fp16
-     down to (n_experts * out * n_groups, bytes_per_group) uint8 + norms.
-     ~4x memory reduction on typical MoE checkpoints.
-  2. Share a single bf16 scratch pool across ALL MoE layers in the model.
-     Only one MoE layer's forward runs at a time, so one dequant buffer
-     is enough. Per-layer scratch would defeat the compression.
-  3. At ``apply()`` time, decompress into the pool and delegate to the
-     existing ``UnquantizedFusedMoEMethod`` kernel path. Same kernel, same
-     performance as BF16 MoE — just with expert weights held in packed
-     form between forward passes.
+production on GLM-5.1 754B and Gemma 4 26B): compress each expert's
+w13 and w2 via the same PolarQuant pipeline used for Linear layers,
+share a single bf16 scratch pool across all MoE layers (only one runs
+at a time during forward), decompress into the pool per-forward and
+delegate to the existing ``UnquantizedFusedMoEMethod`` kernel.
 
 Trade-offs vs a fused-dequant MoE kernel:
 
   - PRO: reuses vLLM's battle-tested unquantized MoE kernel; no new
     kernel surface to review
-  - PRO: correct by construction — decompression math is identical to
-    the Linear path
-  - CON: extra HBM round-trip per forward (read packed, write bf16
-    scratch, read bf16 scratch into MoE kernel). A fused kernel would
-    elide the scratch roundtrip
-  - CON: dequant kernel launched 2x per MoE layer per forward (w13 and w2)
+  - PRO: decompression math matches the Linear path exactly
+  - CON: extra HBM round-trip per forward; dequant launched 2x per
+    MoE layer per forward
 
-Phase 2 (separate PR): replace the Python/Triton dequant with a fused
-3D CUDA kernel that writes directly into the scratch pool with lower
-HBM bandwidth usage. Groundwork exists in the plugin's csrc/.
+Phase 2 (separate PR): replace the Python-level dequant with a fused
+3D CUDA kernel. Groundwork exists in the turboquant-plus-vllm plugin's
+``csrc/tq_weight_dequant.cu``.
 """
 
 from __future__ import annotations
 
-import math
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -48,21 +35,14 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
 )
-
-# Reuse the Linear-path quantizer — same WHT rotation + Lloyd-Max codebook,
-# no separate MoE-specific algorithm.
 from vllm.model_executor.layers.quantization.online.turboquant import (
+    _compress_2d,
     _get_quantizer,
-    _pack_indices,
-    _padded_size,
     _unpack_indices,
 )
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe import FusedMoE
-    from vllm.model_executor.layers.fused_moe.config import (
-        FusedMoEQuantConfig,
-    )
 
 logger = init_logger(__name__)
 
@@ -70,14 +50,9 @@ logger = init_logger(__name__)
 class _Compressed3D:
     """Packed form of a 3D expert weight tensor (n_experts, out, in).
 
-    Compression pipeline matches the Linear path:
-        1. Reshape (n_experts, out, in) → (n_experts * out, in)
-        2. Pad in-dim to group_size multiple, reshape to (-1, group_size)
-        3. Quantize with PolarQuant (WHT + Lloyd-Max codebook)
-        4. Pack indices to uint8 (3-bit: 10 values per int32, or equivalent)
-
-    Memory: bytes per expert weight = (out * in * bits) / 8 + (out * n_groups * 4 for norms).
-    Typical 3-bit compression: ~4.3x over fp16 fp16.
+    Flattens experts into rows, runs the same 2D compression pipeline
+    the Linear path uses, then remembers the original shape for
+    decompression. Typical 3-bit compression: ~4.3x over fp16.
     """
 
     __slots__ = (
@@ -91,33 +66,19 @@ class _Compressed3D:
         self.dtype = data.dtype
         self.bits = bits
         self.group_size = group_size
-        self.padded_in, self.n_groups = _padded_size(in_dim, group_size)
 
         flat = data.reshape(-1, in_dim)
-        if self.padded_in > in_dim:
-            padded = torch.zeros(
-                flat.shape[0], self.padded_in,
-                dtype=flat.dtype, device=flat.device,
-            )
-            padded[:, :in_dim] = flat
-        else:
-            padded = flat
-
-        grouped = padded.reshape(-1, group_size)
-        quantizer = _get_quantizer(group_size, bits, str(data.device))
-        indices, norms = quantizer.quantize(grouped)
-
-        self.packed = _pack_indices(indices, bits)
-        # Norms shape: (n_experts * out, n_groups)
-        self.norms = norms.reshape(n_experts * out_dim, self.n_groups)
+        self.packed, self.norms, self.padded_in, self.n_groups = _compress_2d(
+            flat, bits, group_size,
+        )
 
     def decompress_into(self, out: torch.Tensor) -> None:
         """Write decompressed bf16/fp16 weights into a pre-allocated buffer.
 
-        Phase 1: Python-level dequant via PolarQuant.dequantize(). Correct
-        but ~10x slower than the fused CUDA kernel in the plugin's csrc/.
-        Acceptable for initial MoE-path validation; Phase 2 PR replaces
-        with a direct CUDA dequant matching the Linear path's speed.
+        Phase 1 uses the Python-level dequant path — correct but ~10x
+        slower than the fused CUDA kernel in the turboquant-plus-vllm
+        plugin's csrc/. A Phase 2 PR replaces this with a direct CUDA
+        dequant matching the Linear path's speed.
         """
         assert out.shape == self.shape, (
             f"decompress_into expected shape {self.shape}, got {tuple(out.shape)}"
@@ -129,14 +90,10 @@ class _Compressed3D:
         n_experts, out_dim, in_dim = self.shape
         quantizer = _get_quantizer(self.group_size, self.bits, str(out.device))
 
-        # Unpack indices → dequantize through codebook → reshape back to 3D
         indices = _unpack_indices(self.packed, self.bits, self.padded_in)
-        # indices: (n_experts * out, padded_in). Reshape to (-1, group_size)
         grouped_indices = indices.reshape(-1, self.group_size)
         grouped_norms = self.norms.reshape(-1)
-        # dequantize returns (n_groups_total, group_size)
         dequant = quantizer.dequantize(grouped_indices, grouped_norms)
-        # Reshape back to (n_experts, out, padded_in), then truncate
         dequant = dequant.reshape(n_experts, out_dim, self.padded_in)
         if self.padded_in > in_dim:
             dequant = dequant[:, :, :in_dim]
@@ -146,14 +103,9 @@ class _Compressed3D:
 class _MoEScratchPool:
     """One bf16 scratch buffer pair shared across all MoE layers.
 
-    Only one MoE layer's forward runs at a time in standard dispatch, so
-    a single set of (w13, w2) bf16 tensors is enough to hold the
-    decompressed weights. Per-layer scratch would multiply memory by the
-    layer count and defeat the compression.
-
-    Raises if a later layer has a different expert shape (heterogeneous
-    MoE — not expected in current vLLM-supported models but we fail loud
-    rather than produce wrong results from a mismatched buffer).
+    Only one MoE layer runs at a time during forward, so a single set
+    of (w13, w2) bf16 tensors is enough. Per-layer scratch would
+    multiply memory by the layer count and defeat the compression.
     """
 
     __slots__ = ("w13", "w2", "shape_w13", "shape_w2")
@@ -178,8 +130,9 @@ class _MoEScratchPool:
             )
 
 
-# Module-level singleton. Set by the first TurboQuantOnlineFusedMoEMethod
-# in the model; reused by all subsequent ones.
+# Module-level singleton. TODO(phase-2): move to per-model-config scope
+# so multi-model-per-process cases (speculative draft models, LoRA
+# routers) don't share a pool sized for the first-loaded model.
 _MOE_SCRATCH_POOL: _MoEScratchPool | None = None
 
 
@@ -211,33 +164,27 @@ class TurboQuantOnlineFusedMoEMethod(OnlineMoEMethodBase):
         self.bits = bits
         self.group_size = group_size
 
-        # Lazy imports to stay CPU-import-safe for tests.
+        # Delegation over inheritance for apply(): hold an
+        # UnquantizedFusedMoEMethod and call its apply() after we've
+        # populated the scratch pool. We still inherit OnlineMoEMethodBase
+        # for its create_weights + initialize_online_processing setup,
+        # but override apply() to insert the dequant step.
         from vllm.model_executor.layers.fused_moe import (
             UnquantizedFusedMoEMethod,
         )
-        # We delegate forward to the unquantized kernel on the post-dequant
-        # bf16 weights. Holding a reference so apply() can call its logic
-        # without re-instantiating.
-        self._base_method: Any = UnquantizedFusedMoEMethod(layer.moe_config)
-
-    # ------------------------------------------------------------------
-    # Weight compression at model-load time
-    # ------------------------------------------------------------------
+        self._base_method = UnquantizedFusedMoEMethod(layer.moe_config)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         global _MOE_SCRATCH_POOL
         if getattr(layer, "_already_called_process_weights_after_loading", False):
             return
 
-        w13 = layer.w13_weight.data  # (E, 2 * I, H)
-        w2 = layer.w2_weight.data   # (E, H, I)
+        w13 = layer.w13_weight.data
+        w2 = layer.w2_weight.data
 
-        # Compress both tensors in-place. Expert loop unrolled by the
-        # per-expert reshape inside _Compressed3D.
         w13_c = _Compressed3D(w13, self.bits, self.group_size)
         w2_c = _Compressed3D(w2, self.bits, self.group_size)
 
-        # Initialize or validate the shared scratch pool.
         if _MOE_SCRATCH_POOL is None:
             _MOE_SCRATCH_POOL = _MoEScratchPool(
                 w13_shape=w13_c.shape, w2_shape=w2_c.shape,
@@ -246,30 +193,17 @@ class TurboQuantOnlineFusedMoEMethod(OnlineMoEMethodBase):
         else:
             _MOE_SCRATCH_POOL.assert_matches(w13_c.shape, w2_c.shape)
 
-        # Re-point the layer's w13_weight / w2_weight at the pool buffers.
-        # The unquantized kernel we delegate to reads layer.w13_weight /
-        # layer.w2_weight directly, so writing into the pool makes the
-        # freshly-dequantized values visible on the next forward.
+        # Re-point layer's weight parameters at the pool buffers so the
+        # unquantized kernel (which reads layer.w13_weight / w2_weight)
+        # sees freshly-dequantized values on each forward.
         layer.w13_weight.data = _MOE_SCRATCH_POOL.w13
         layer.w2_weight.data = _MOE_SCRATCH_POOL.w2
 
-        # Stash the compressed tensors on the layer for apply() to read.
         layer._tq_w13_compressed = w13_c
         layer._tq_w2_compressed = w2_c
         layer._tq_scratch_pool = _MOE_SCRATCH_POOL
 
         layer._already_called_process_weights_after_loading = True
-
-    # ------------------------------------------------------------------
-    # Forward dispatch
-    # ------------------------------------------------------------------
-
-    def get_fused_moe_quant_config(
-        self, layer: torch.nn.Module,
-    ) -> "FusedMoEQuantConfig | None":
-        # Decompression happens in apply() before delegating to the base
-        # (unquantized) method; there's no quant-aware kernel to configure.
-        return None
 
     def apply(
         self,
@@ -279,11 +213,6 @@ class TurboQuantOnlineFusedMoEMethod(OnlineMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # Decompress both expert tensors into the shared scratch pool.
-        # layer.w13_weight.data / layer.w2_weight.data were re-pointed at
-        # pool.w13 / pool.w2 in process_weights_after_loading, so writing
-        # into the pool makes the decompressed weights visible to the
-        # unquantized kernel.
         pool = layer._tq_scratch_pool
         layer._tq_w13_compressed.decompress_into(pool.w13)
         layer._tq_w2_compressed.decompress_into(pool.w2)
