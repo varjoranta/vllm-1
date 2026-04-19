@@ -30,9 +30,19 @@ import torch
 import torch.nn as nn
 
 try:
-    import flute
-    import flute.integrations.higgs as _flute_higgs
-    import flute.utils as _flute_utils
+    # Prefer the vendored build shipped inside turboquant-plus-vllm. This
+    # is the FLUTE CUDA/C++ source tree (Guo et al., EMNLP Findings 2024;
+    # github.com/HanGuo97/flute) compiled under namespace turboquant_flute
+    # so it coexists with any externally installed flute-kernel. If the
+    # plugin isn't on PYTHONPATH, fall back to external flute-kernel.
+    try:
+        from turboquant_vllm import flute  # type: ignore[import-not-found]
+        from turboquant_vllm.flute.integrations import higgs as _flute_higgs  # type: ignore[import-not-found]
+        from turboquant_vllm.flute import utils as _flute_utils  # type: ignore[import-not-found]
+    except ImportError:
+        import flute  # type: ignore[import-not-found]
+        import flute.integrations.higgs as _flute_higgs  # type: ignore[import-not-found]
+        import flute.utils as _flute_utils  # type: ignore[import-not-found]
 
     _HAS_FLUTE = True
 except ImportError:
