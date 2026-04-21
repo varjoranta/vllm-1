@@ -64,30 +64,123 @@ def _fast_wht_batch(x: torch.Tensor) -> torch.Tensor:
     return x.div_(math.sqrt(n))
 
 
+def _fast_wht_batch_blocked(x: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Batched fast WHT applied independently to each block of width ``block_size``.
+
+    Equivalent to ``block_diag(H, H, ..., H) @ x`` where each ``H`` is a
+    ``block_size × block_size`` Walsh-Hadamard matrix. Used for partial-rotary
+    models (MiniMax M2.5/M2.7, Qwen3.6-A3B, etc.) so the RoPE-rotated prefix
+    and the content-only suffix are kept under separate rotations and don't
+    mix inside a group (MidasMining, PR #39970 comment, 2026-04-21).
+
+    ``x.shape[1]`` must be a multiple of ``block_size``; ``block_size`` must
+    be a power of two.
+    """
+    n = x.shape[1]
+    assert n % block_size == 0, (
+        f"dim {n} not divisible by block_size {block_size}"
+    )
+    assert block_size & (block_size - 1) == 0, (
+        f"block_size {block_size} must be a power of two"
+    )
+    num_blocks = n // block_size
+    x_blocks = x.reshape(x.shape[0] * num_blocks, block_size)
+    x_blocks = _fast_wht_batch(x_blocks)
+    return x_blocks.reshape(x.shape[0], n)
+
+
 
 
 # ---------------------------------------------------------------------------
 # PolarQuant quantizer
 # ---------------------------------------------------------------------------
 
-# Cache: (group_size, bits, device_str) → PolarQuant instance
-_quantizers: dict[tuple[int, int, str], "_PolarQuant"] = {}
+# Cache: (group_size, bits, device_str, rotary_dim) → PolarQuant instance
+_quantizers: dict[tuple[int, int, str, "int | None"], "_PolarQuant"] = {}
 
 
-def _get_quantizer(group_size: int, bits: int, device: str) -> "_PolarQuant":
+def _get_quantizer(
+    group_size: int,
+    bits: int,
+    device: str,
+    rotary_dim: "int | None" = None,
+) -> "_PolarQuant":
+    """Return a cached ``_PolarQuant``.
+
+    ``rotary_dim`` selects between a full-width WHT (``None``) and a block-
+    diagonal WHT (each block ``rotary_dim`` wide). Only meaningful when
+    ``rotary_dim < group_size``; otherwise folded to ``None`` so full-width
+    quantizers are shared.
+    """
     dev = torch.device(device)
     if dev.type == "cuda" and dev.index is None:
         dev = torch.device("cuda", torch.cuda.current_device())
-    key = (group_size, bits, str(dev))
+    effective_rotary_dim = (
+        rotary_dim
+        if (rotary_dim is not None and rotary_dim < group_size)
+        else None
+    )
+    key = (group_size, bits, str(dev), effective_rotary_dim)
     if key not in _quantizers:
-        _quantizers[key] = _PolarQuant(group_size, bits, device=str(dev))
+        _quantizers[key] = _PolarQuant(
+            group_size, bits, device=str(dev),
+            rotary_dim=effective_rotary_dim,
+        )
     return _quantizers[key]
 
 
-class _PolarQuant:
-    """WHT rotation + Gaussian Lloyd-Max codebook quantizer."""
+def _derive_rotary_dim(model_config, head_dim: int) -> "int | None":
+    """Extract a block-diag rotary_dim from an HF text config, or None.
 
-    def __init__(self, dim: int, bits: int, seed: int = 42, device: str = "cuda"):
+    Returns ``None`` (→ full-width WHT) unless ``partial_rotary_factor``
+    is set to a value in ``(0, 1)``. When set, returns the largest power
+    of two that divides ``head_dim`` and is ≤ ``head_dim * factor``.
+
+    Examples:
+        Qwen3.6-35B-A3B (head_dim=256, factor=0.25) → 64
+        MiniMax M2.7   (head_dim=128, factor=0.5)  → 64
+        Qwen3-8B       (head_dim=128, factor=1.0)  → None
+    """
+    if model_config is None:
+        return None
+    cfg = (
+        getattr(model_config, "hf_text_config", None)
+        or getattr(model_config, "hf_config", None)
+        or model_config
+    )
+    if cfg is None:
+        return None
+    factor = getattr(cfg, "partial_rotary_factor", None)
+    if factor is None:
+        rope_params = getattr(cfg, "rope_parameters", None)
+        if isinstance(rope_params, dict):
+            factor = rope_params.get("partial_rotary_factor")
+    if factor is None or factor >= 1.0 or factor <= 0.0:
+        return None
+    rd_target = int(head_dim * factor)
+    if rd_target <= 0 or rd_target >= head_dim:
+        return None
+    rd_p2 = 1 << (rd_target.bit_length() - 1)
+    if rd_p2 <= 0 or head_dim % rd_p2 != 0:
+        return None
+    return rd_p2
+
+
+class _PolarQuant:
+    """WHT rotation + Gaussian Lloyd-Max codebook quantizer.
+
+    ``rotary_dim`` selects full-width WHT (``None``) vs block-diagonal WHT
+    with independent ``rotary_dim``-wide blocks. See ``_fast_wht_batch_blocked``.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        bits: int,
+        seed: int = 42,
+        device: str = "cuda",
+        rotary_dim: "int | None" = None,
+    ):
         self.dim = dim
         self.bits = bits
         dev = torch.device(device)
@@ -102,11 +195,28 @@ class _PolarQuant:
         self.signs1 = generate_wht_signs(self.padded_dim, seed=seed, device=dev)
         self.signs2 = generate_wht_signs(self.padded_dim, seed=seed + 1, device=dev)
 
+        if rotary_dim is not None and 0 < rotary_dim < dim:
+            assert rotary_dim & (rotary_dim - 1) == 0, (
+                f"rotary_dim {rotary_dim} must be a power of two"
+            )
+            assert self.padded_dim % rotary_dim == 0, (
+                f"rotary_dim {rotary_dim} must divide padded_dim "
+                f"{self.padded_dim}"
+            )
+            self.rotary_dim = rotary_dim
+        else:
+            self.rotary_dim = None
+
         # Reuse the Lloyd-Max codebook from the KV-cache TurboQuant module
         # (added in #38479). It's scipy-free (trapezoid integration) and
         # cached via lru_cache on (dim, bits).
         self.centroids = get_centroids(dim, bits).to(dev)
         self.boundaries = (self.centroids[:-1] + self.centroids[1:]) / 2
+
+    def _apply_wht(self, padded: torch.Tensor) -> torch.Tensor:
+        if self.rotary_dim is None:
+            return _fast_wht_batch(padded)
+        return _fast_wht_batch_blocked(padded, block_size=self.rotary_dim)
 
     def _rotate(self, x: torch.Tensor) -> torch.Tensor:
         batch = x.shape[0]
@@ -116,7 +226,7 @@ class _PolarQuant:
         else:
             padded = x.clone()
         padded *= self.signs1.unsqueeze(0)
-        padded = _fast_wht_batch(padded)
+        padded = self._apply_wht(padded)
         padded *= self.signs2.unsqueeze(0)
         return padded[:, : self.dim]
 
@@ -130,7 +240,7 @@ class _PolarQuant:
         else:
             padded = y
         padded *= self.signs2.unsqueeze(0)
-        padded = _fast_wht_batch(padded)
+        padded = self._apply_wht(padded)
         padded *= self.signs1.unsqueeze(0)
         return padded[:, : self.dim]
 
@@ -178,15 +288,18 @@ def _padded_size(dim: int, group_size: int) -> tuple[int, int]:
 
 
 def _compress_2d(
-    flat: torch.Tensor, bits: int, group_size: int
+    flat: torch.Tensor,
+    bits: int,
+    group_size: int,
+    rotary_dim: "int | None" = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
     """Compress a 2D (rows, in_dim) tensor via PolarQuant + bit-packing.
 
-    Shared between the Linear and MoE paths. Returns
-    (packed, norms_per_row, padded_in, n_groups) where:
-      - packed is uint8, shape (rows, packed_cols) for the given bits
-      - norms_per_row has shape (rows, n_groups)
-      - padded_in is the group-aligned in_dim
+    Shared between the Linear and MoE paths. ``rotary_dim`` is forwarded to
+    ``_get_quantizer`` to select full-width vs block-diagonal WHT; pass
+    ``None`` (default) for everything except attention q/k/qkv projections
+    on partial-rotary models. Returns (packed, norms_per_row, padded_in,
+    n_groups).
     """
     rows, in_dim = flat.shape
     padded_in, n_groups = _padded_size(in_dim, group_size)
@@ -194,7 +307,9 @@ def _compress_2d(
         flat = torch.nn.functional.pad(flat, (0, padded_in - in_dim))
 
     grouped = flat.reshape(-1, group_size)
-    quantizer = _get_quantizer(group_size, bits, str(flat.device))
+    quantizer = _get_quantizer(
+        group_size, bits, str(flat.device), rotary_dim=rotary_dim,
+    )
     indices, norms_raw = quantizer.quantize(grouped)
     packed = _pack_indices(indices, bits)
     norms = norms_raw.reshape(rows, n_groups)
@@ -688,7 +803,12 @@ class TurboQuantOnlineLinearMethod(LinearMethodBase):
 
     uses_meta_device: bool = True
 
-    def __init__(self, bits: int = 3, group_size: int = 128):
+    def __init__(
+        self,
+        bits: int = 3,
+        group_size: int = 128,
+        rotary_dim: "int | None" = None,
+    ):
         if bits not in (2, 3, 4):
             raise ValueError(f"turboquant bits must be 2, 3, or 4; got {bits}")
         if group_size <= 0 or group_size % 8 != 0:
@@ -698,6 +818,7 @@ class TurboQuantOnlineLinearMethod(LinearMethodBase):
             )
         self.bits = bits
         self.group_size = group_size
+        self.rotary_dim = rotary_dim
 
     def create_weights(
         self,
@@ -735,8 +856,12 @@ class TurboQuantOnlineLinearMethod(LinearMethodBase):
         group_size = self.group_size
 
         out_dim, in_dim = weight.shape
-        packed, norms, padded_in, n_groups = _compress_2d(weight, bits, group_size)
-        quantizer = _get_quantizer(group_size, bits, str(weight.device))
+        packed, norms, padded_in, n_groups = _compress_2d(
+            weight, bits, group_size, rotary_dim=self.rotary_dim,
+        )
+        quantizer = _get_quantizer(
+            group_size, bits, str(weight.device), rotary_dim=self.rotary_dim,
+        )
 
         # Keep weight attr for vLLM's MLA post-processing (expects it to exist)
         layer.weight.data = torch.empty(0, device=weight.device, dtype=weight.dtype)
@@ -749,7 +874,11 @@ class TurboQuantOnlineLinearMethod(LinearMethodBase):
         layer.tq_out_features = out_dim
         layer.tq_padded_in = padded_in
 
-        if tq_fused_gemm is not None:
+        # Triton kernels only implement full-width WHT. When we compressed
+        # with a block-diagonal WHT (partial-rotary models), the kernel's
+        # forward WHT wouldn't match and would produce garbage; fall back
+        # to the PyTorch path which honours ``self.rotary_dim``.
+        if tq_fused_gemm is not None and self.rotary_dim is None:
             layer._tq_primary_fn = tq_fwht_input_gemm if out_dim >= 4096 else tq_fused_gemm
             layer._tq_fallback_fn = tq_fused_gemm if out_dim >= 4096 else tq_fwht_input_gemm
         else:
@@ -786,7 +915,10 @@ class TurboQuantOnlineLinearMethod(LinearMethodBase):
         # PyTorch fallback (no Triton)
         indices = _unpack_indices(layer.tq_packed_weight, self.bits, self.group_size)
         norms_flat = layer.tq_norms.reshape(-1)
-        quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
+        quantizer = _get_quantizer(
+            self.group_size, self.bits, str(x.device),
+            rotary_dim=self.rotary_dim,
+        )
         w_groups = quantizer.dequantize(indices, norms_flat)
         w_deq = w_groups.reshape(layer.tq_out_features, layer.tq_padded_in).to(x.dtype)
         output = torch.matmul(x, w_deq.t())

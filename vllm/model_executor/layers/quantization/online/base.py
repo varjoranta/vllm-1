@@ -39,6 +39,7 @@ from vllm.model_executor.layers.quantization.online.int8 import (
 )
 from vllm.model_executor.layers.quantization.online.turboquant import (
     TurboQuantOnlineLinearMethod,
+    _derive_rotary_dim,
 )
 from vllm.model_executor.layers.quantization.online.turboquant_moe import (
     TurboQuantOnlineFusedMoEMethod,
@@ -120,6 +121,9 @@ class OnlineQuantizationConfig(QuantizationConfig):
                     tq_kwargs["bits"] = self.args.bits
                 if self.args.group_size is not None:
                     tq_kwargs["group_size"] = self.args.group_size
+                rotary_dim = self._get_turboquant_rotary_dim()
+                if rotary_dim is not None:
+                    tq_kwargs["rotary_dim"] = rotary_dim
                 return TurboQuantOnlineLinearMethod(**tq_kwargs)
             elif linear_scheme == OnlineQuantScheme.FP8_PER_BLOCK:
                 return Fp8PerBlockOnlineLinearMethod()
@@ -150,3 +154,41 @@ class OnlineQuantizationConfig(QuantizationConfig):
             else:
                 return Fp8PerTensorOnlineMoEMethod(layer=layer)
         return None
+
+    def _get_turboquant_rotary_dim(self) -> "int | None":
+        """Derive a block-diag rotary_dim for partial-rotary models.
+
+        Returns ``None`` unless the loaded model has a ``partial_rotary_factor``
+        in ``(0, 1)`` on its HF text config; in that case returns the largest
+        power of two that divides ``head_dim`` and is ≤ ``head_dim * factor``.
+        Applied uniformly to every TurboQuant Linear layer — attention
+        projections need it for correctness; for other Linears a block-diag
+        WHT is just a different (equally valid) random rotation pattern.
+        """
+        try:
+            from vllm.config import get_current_vllm_config
+        except ImportError:
+            return None
+        try:
+            vllm_config = get_current_vllm_config()
+        except (AssertionError, RuntimeError, LookupError):
+            return None
+        model_config = getattr(vllm_config, "model_config", None)
+        if model_config is None:
+            return None
+        head_dim = getattr(model_config, "get_head_size", None)
+        if head_dim is not None:
+            try:
+                head_dim_val = int(model_config.get_head_size())
+            except Exception:
+                head_dim_val = None
+        else:
+            head_dim_val = None
+        if head_dim_val is None:
+            hf_text = getattr(model_config, "hf_text_config", None) or getattr(
+                model_config, "hf_config", None
+            )
+            head_dim_val = getattr(hf_text, "head_dim", None) if hf_text else None
+        if head_dim_val is None or head_dim_val <= 0:
+            return None
+        return _derive_rotary_dim(model_config, head_dim_val)
