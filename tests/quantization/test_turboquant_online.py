@@ -10,6 +10,8 @@ These are all CPU-only and can run without a GPU.
 Run: python -m pytest tests/quantization/test_turboquant_online.py -v
 """
 
+import math
+
 import pytest
 import torch
 import torch.nn as nn
@@ -17,6 +19,7 @@ import torch.nn as nn
 from vllm.model_executor.layers.quantization.online.turboquant import (
     TurboQuantOnlineLinearMethod,
     _fast_wht_batch,
+    _fast_wht_batch_blocked,
     _get_quantizer,
     _pack_indices,
     _padded_size,
@@ -439,3 +442,186 @@ class TestTurboQuantConfigValidation:
         method = TurboQuantOnlineLinearMethod()
         assert method.bits == 3
         assert method.group_size == 128
+
+
+# ============================================================================
+# Block-diagonal WHT for partial_rotary_factor models (MiniMax M2.5/M2.7 etc.)
+#
+# Without block-diagonal rotation, the full 128×128 WHT mixes RoPE-rotated
+# dims with content-only dims, corrupting position encoding — measured as a
+# ~9 ppt quality regression (MidasMining, PR #39970 comment, 2026-04-21).
+# Fix: independent WHT per semantic block.
+# ============================================================================
+
+
+class TestBlockDiagonalWHT:
+    """Correctness of _fast_wht_batch_blocked against explicit block_diag(H, H).
+
+    All tests CPU-only, no GPU required.
+    """
+
+    @staticmethod
+    def _explicit_hadamard_matrix(n: int) -> torch.Tensor:
+        """Build a size-n Walsh-Hadamard matrix explicitly. O(n²) memory — only for tests."""
+        assert n & (n - 1) == 0
+        H = torch.tensor([[1.0]])
+        while H.shape[0] < n:
+            H = torch.cat(
+                [
+                    torch.cat([H, H], dim=1),
+                    torch.cat([H, -H], dim=1),
+                ],
+                dim=0,
+            )
+        return H / math.sqrt(n)
+
+    @pytest.mark.parametrize("block_size", [32, 64, 128])
+    def test_blocked_equals_explicit_block_diag(self, block_size):
+        """_fast_wht_batch_blocked(x, block) == block_diag(H, H, ...) @ x."""
+        batch, n = 4, 256
+        assert n % block_size == 0
+        num_blocks = n // block_size
+        x = torch.randn(batch, n)
+
+        # Our fast-path
+        out_fast = _fast_wht_batch_blocked(x.clone(), block_size)
+
+        # Explicit construction via torch.block_diag
+        H_small = self._explicit_hadamard_matrix(block_size)
+        H_block = torch.block_diag(*([H_small] * num_blocks))
+        out_explicit = (H_block @ x.T).T
+
+        torch.testing.assert_close(out_fast, out_explicit, rtol=1e-5, atol=1e-5)
+
+    @pytest.mark.parametrize("block_size", [32, 64, 128])
+    def test_blocked_is_self_inverse(self, block_size):
+        """Block-diagonal WHT is self-inverse (like the full WHT)."""
+        batch, n = 4, 256
+        x = torch.randn(batch, n)
+        y = _fast_wht_batch_blocked(x.clone(), block_size)
+        xr = _fast_wht_batch_blocked(y.clone(), block_size)
+        torch.testing.assert_close(xr, x, rtol=1e-5, atol=1e-5)
+
+    def test_blocked_matches_full_when_block_equals_dim(self):
+        """When block_size == dim, blocked WHT must equal full WHT."""
+        batch, n = 4, 128
+        x = torch.randn(batch, n)
+        out_blocked = _fast_wht_batch_blocked(x.clone(), block_size=n)
+        out_full = _fast_wht_batch(x.clone())
+        torch.testing.assert_close(out_blocked, out_full, rtol=1e-5, atol=1e-5)
+
+    def test_block_isolation_prevents_cross_contamination(self):
+        """The semantic guarantee: block-diagonal rotation MUST NOT leak energy
+        between blocks. Construct x with signal only in block 0 and zero in
+        block 1; after block-diagonal rotation, block 1 output stays zero.
+        """
+        batch, n, rotary_dim = 4, 128, 64
+        x = torch.zeros(batch, n)
+        # Non-trivial signal in the rotary block
+        x[:, :rotary_dim] = torch.randn(batch, rotary_dim)
+
+        out = _fast_wht_batch_blocked(x.clone(), block_size=rotary_dim)
+
+        # Block 0 (rotary) should have non-zero energy after rotation
+        assert out[:, :rotary_dim].abs().sum() > 0
+        # Block 1 (content) should remain EXACTLY zero — no leakage
+        torch.testing.assert_close(
+            out[:, rotary_dim:],
+            torch.zeros(batch, n - rotary_dim),
+            rtol=0.0,
+            atol=0.0,
+        )
+
+    def test_full_wht_DOES_mix_blocks_showing_the_bug(self):
+        """Sanity: the full WHT (not block-diagonal) WILL leak energy across
+        the rotary/content boundary. This is the bug MidasMining reported —
+        if this test ever fails, the block-diagonal fix stopped being needed.
+        """
+        batch, n, rotary_dim = 4, 128, 64
+        x = torch.zeros(batch, n)
+        x[:, :rotary_dim] = torch.randn(batch, rotary_dim)
+
+        out = _fast_wht_batch(x.clone())
+
+        # Full WHT cross-pollinates: the content half should now have real signal
+        content_energy = out[:, rotary_dim:].abs().sum().item()
+        assert content_energy > 0, (
+            f"Full WHT unexpectedly preserves block isolation "
+            f"(content_energy={content_energy}). The block-diagonal fix may "
+            f"no longer be needed — double-check the WHT implementation."
+        )
+
+
+class TestPolarQuantBlockDiagonalRotation:
+    """End-to-end rotation tests with rotary_dim set on _PolarQuant."""
+
+    @pytest.fixture(autouse=True)
+    def cpu_device(self, monkeypatch):
+        """Force device='cpu' so these run without a GPU."""
+        import os
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+
+    @pytest.mark.parametrize(
+        "dim,rotary_dim",
+        [
+            (128, 64),   # MiniMax M2.7 partial_rotary_factor=0.5 (2 blocks)
+            (128, 32),   # hypothetical 0.25 on head_dim=128 (4 blocks)
+            (256, 64),   # Qwen3.6-A3B partial_rotary_factor=0.25 (4 blocks)
+            (256, 128),  # hypothetical 0.5 on head_dim=256 (2 blocks)
+        ],
+    )
+    def test_round_trip_preserves_input(self, dim, rotary_dim):
+        """rotate → rotate_inverse returns the original (within fp noise)."""
+        q = _PolarQuant(dim=dim, bits=3, device="cpu", rotary_dim=rotary_dim)
+        x = torch.randn(8, dim)
+        y = q._rotate(x.clone())
+        x_back = q._rotate_inverse(y)
+        torch.testing.assert_close(x_back, x, rtol=1e-4, atol=1e-4)
+
+    def test_no_rotary_dim_matches_old_full_wht(self):
+        """rotary_dim=None must produce bit-identical output to old full-WHT path."""
+        dim = 128
+        x = torch.randn(8, dim)
+        q_old = _PolarQuant(dim=dim, bits=3, device="cpu", rotary_dim=None)
+        q_same = _PolarQuant(dim=dim, bits=3, device="cpu")  # default
+        torch.testing.assert_close(q_old._rotate(x.clone()), q_same._rotate(x.clone()))
+
+    def test_block_diagonal_isolates_semantic_blocks(self):
+        """The fundamental semantic guarantee: a unit vector in block 0
+        rotates within block 0 only. Energy in block 1 stays zero.
+        """
+        dim, rotary_dim = 128, 64
+        q = _PolarQuant(dim=dim, bits=3, device="cpu", rotary_dim=rotary_dim)
+
+        # Signal in rotary block only
+        x = torch.zeros(4, dim)
+        x[:, :rotary_dim] = torch.randn(4, rotary_dim)
+        y = q._rotate(x.clone())
+        torch.testing.assert_close(
+            y[:, rotary_dim:],
+            torch.zeros(4, dim - rotary_dim),
+            rtol=0.0,
+            atol=1e-6,
+        )
+
+        # Mirror: signal in content block only
+        x2 = torch.zeros(4, dim)
+        x2[:, rotary_dim:] = torch.randn(4, dim - rotary_dim)
+        y2 = q._rotate(x2.clone())
+        torch.testing.assert_close(
+            y2[:, :rotary_dim],
+            torch.zeros(4, rotary_dim),
+            rtol=0.0,
+            atol=1e-6,
+        )
+
+    def test_rotary_dim_disabled_when_equal_to_dim(self):
+        """rotary_dim >= dim should fall back to full WHT (trivially
+        block-diagonal with one block = the whole thing)."""
+        dim = 128
+        x = torch.randn(4, dim)
+        q_full = _PolarQuant(dim=dim, bits=3, device="cpu", rotary_dim=None)
+        q_rd_eq = _PolarQuant(dim=dim, bits=3, device="cpu", rotary_dim=dim)
+        # Both should match — the rotary_dim=dim case defensively sets
+        # self.rotary_dim=None in __init__ (via the `< dim` gate).
+        torch.testing.assert_close(q_full._rotate(x.clone()), q_rd_eq._rotate(x.clone()))

@@ -64,30 +64,130 @@ def _fast_wht_batch(x: torch.Tensor) -> torch.Tensor:
     return x / math.sqrt(n)
 
 
+def _fast_wht_batch_blocked(x: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Batched fast WHT applied independently to each block of width ``block_size``.
+
+    Equivalent to ``block_diag(H, H, ..., H) @ x`` where each ``H`` is a
+    ``block_size × block_size`` Walsh-Hadamard matrix.  Used for models with
+    ``partial_rotary_factor < 1.0`` (MiniMax M2.5/M2.7 family etc.) where the
+    head_dim is split into a RoPE-rotated prefix and a content-only suffix —
+    a full-width WHT would mix the two semantic groups and corrupt position
+    encoding (MidasMining, PR #39970 comment, 2026-04-21).
+
+    Args:
+        x: ``(batch, n)`` tensor. ``n`` must be a multiple of ``block_size``.
+        block_size: width of each independent Hadamard block. Must be a power
+            of two.
+    """
+    n = x.shape[1]
+    assert n % block_size == 0, (
+        f"dim {n} not divisible by block_size {block_size}"
+    )
+    assert block_size & (block_size - 1) == 0, (
+        f"block_size {block_size} must be a power of two"
+    )
+    num_blocks = n // block_size
+    x_blocks = x.reshape(x.shape[0] * num_blocks, block_size)
+    x_blocks = _fast_wht_batch(x_blocks)
+    return x_blocks.reshape(x.shape[0], n)
+
+
 
 
 # ---------------------------------------------------------------------------
 # PolarQuant quantizer
 # ---------------------------------------------------------------------------
 
-# Cache: (group_size, bits, device_str) → PolarQuant instance
-_quantizers: dict[tuple[int, int, str], "_PolarQuant"] = {}
+# Cache: (group_size, bits, device_str, rotary_dim) → PolarQuant instance
+_quantizers: dict[tuple[int, int, str, int | None], "_PolarQuant"] = {}
 
 
-def _get_quantizer(group_size: int, bits: int, device: str) -> "_PolarQuant":
+def _get_quantizer(
+    group_size: int,
+    bits: int,
+    device: str,
+    rotary_dim: int | None = None,
+) -> "_PolarQuant":
+    """Return a cached ``_PolarQuant`` configured with the given rotation shape.
+
+    ``rotary_dim`` selects between a full-width WHT (``None``) and a block-
+    diagonal WHT that keeps the RoPE-rotated head prefix separate from the
+    content-only suffix. See ``_PolarQuant`` docstring.
+    """
     dev = torch.device(device)
     if dev.type == "cuda" and dev.index is None:
         dev = torch.device("cuda", torch.cuda.current_device())
-    key = (group_size, bits, str(dev))
+    # Normalize rotary_dim=dim (≥ dim) to None so the cache key matches
+    # the no-op case and both produce a full-width WHT.
+    effective_rotary_dim = rotary_dim if (rotary_dim is not None and rotary_dim < group_size) else None
+    key = (group_size, bits, str(dev), effective_rotary_dim)
     if key not in _quantizers:
-        _quantizers[key] = _PolarQuant(group_size, bits, device=str(dev))
+        _quantizers[key] = _PolarQuant(
+            group_size, bits, device=str(dev), rotary_dim=effective_rotary_dim
+        )
     return _quantizers[key]
 
 
-class _PolarQuant:
-    """WHT rotation + Gaussian Lloyd-Max codebook quantizer."""
+def _derive_rotary_dim(model_config, head_dim: int) -> int | None:
+    """Derive the rotary-dim block for block-diagonal WHT from a model config.
 
-    def __init__(self, dim: int, bits: int, seed: int = 42, device: str = "cuda"):
+    Returns ``None`` (full-width WHT) unless ``partial_rotary_factor < 1.0``
+    is set on the HF text config. When set, returns the power-of-two
+    prefix size such that ``head_dim / rotary_dim`` is an integer (the
+    content suffix gets split into ``head_dim/rotary_dim − 1`` independent
+    WHTs of the same width — all content blocks share the same semantic
+    role so their internal rotation pattern is arbitrary).
+
+    Examples:
+        MiniMax M2.7 (head_dim=128, factor=0.5) → rotary_dim=64 (2 blocks)
+        Qwen3.6-A3B (head_dim=256, factor=0.25) → rotary_dim=64 (4 blocks)
+        Qwen3-8B (head_dim=128, factor=1.0)    → None (full-width WHT)
+    """
+    if model_config is None:
+        return None
+    cfg = getattr(model_config, "hf_text_config", None) or getattr(model_config, "hf_config", None)
+    if cfg is None:
+        return None
+    factor = getattr(cfg, "partial_rotary_factor", None)
+    if factor is None or factor >= 1.0 or factor <= 0.0:
+        return None
+    rd_target = int(head_dim * factor)
+    if rd_target <= 0 or rd_target >= head_dim:
+        return None
+    # Round DOWN to nearest power of two and ensure it divides head_dim.
+    rd_p2 = 1 << (rd_target.bit_length() - 1)
+    if rd_p2 <= 0 or head_dim % rd_p2 != 0:
+        # head_dim isn't a multiple of the rounded-down rotary_dim — the
+        # block split can't tile the head cleanly. Fall back to full-width
+        # WHT (preserves current behaviour, no regression).
+        return None
+    return rd_p2
+
+
+class _PolarQuant:
+    """WHT rotation + Gaussian Lloyd-Max codebook quantizer.
+
+    ``rotary_dim`` controls the rotation structure:
+
+    - ``None`` (default) or ``>= dim``: full-width randomized WHT across the
+      whole ``dim``. Right for uniform-rotary models (Llama, Qwen3, most
+      architectures).
+    - ``< dim``: block-diagonal randomized WHT with independent rotations
+      on ``[0:rotary_dim]`` (RoPE-rotated) and ``[rotary_dim:dim]``
+      (content-only). Required for partial-rotary models like MiniMax M2.5/
+      M2.7 where mixing the two semantic groups corrupts position encoding
+      (~9 ppt quality regression on state-tracking benches otherwise;
+      MidasMining, PR #39970 comment, 2026-04-21).
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        bits: int,
+        seed: int = 42,
+        device: str = "cuda",
+        rotary_dim: int | None = None,
+    ):
         self.dim = dim
         self.bits = bits
         dev = torch.device(device)
@@ -102,11 +202,52 @@ class _PolarQuant:
         self.signs1 = generate_wht_signs(self.padded_dim, seed=seed, device=dev)
         self.signs2 = generate_wht_signs(self.padded_dim, seed=seed + 1, device=dev)
 
+        # Block-diagonal WHT when the model splits head_dim into a rotary
+        # prefix and a content-only suffix (e.g. partial_rotary_factor < 1).
+        # None ⇒ full-width WHT.
+        #
+        # We split the head into equal-width blocks of size ``rotary_dim``,
+        # each rotated by an independent ``rotary_dim``-wide WHT. Block 0 is
+        # the RoPE-rotated prefix; blocks 1..K are the content suffix, split
+        # into K = (padded_dim / rotary_dim − 1) independent WHTs. The
+        # semantic guarantee we need — block 0's signal cannot leak into any
+        # content block — holds regardless of whether the content block
+        # itself is one WHT or several, since all content dims share the
+        # same semantic role (no position encoding).
+        #
+        # Requirements: rotary_dim is a power of two and divides padded_dim.
+        # For head_dim=256, rotary_dim=64 (Qwen3.6-35B-A3B): 4 blocks of 64.
+        # For head_dim=128, rotary_dim=64 (MiniMax M2.7): 2 blocks of 64.
+        if rotary_dim is not None and 0 < rotary_dim < dim:
+            assert rotary_dim & (rotary_dim - 1) == 0, (
+                f"rotary_dim {rotary_dim} must be a power of two"
+            )
+            assert self.padded_dim % rotary_dim == 0, (
+                f"rotary_dim {rotary_dim} must divide padded_dim "
+                f"{self.padded_dim}"
+            )
+            self.rotary_dim = rotary_dim
+        else:
+            self.rotary_dim = None
+
         # Reuse the Lloyd-Max codebook from the KV-cache TurboQuant module
         # (added in #38479). It's scipy-free (trapezoid integration) and
         # cached via lru_cache on (dim, bits).
         self.centroids = get_centroids(dim, bits).to(dev)
         self.boundaries = (self.centroids[:-1] + self.centroids[1:]) / 2
+
+    def _apply_wht(self, padded: torch.Tensor) -> torch.Tensor:
+        """Apply the forward WHT (either full-width or block-diagonal).
+
+        When ``rotary_dim`` is set, runs independent ``rotary_dim``-wide WHTs
+        on each ``rotary_dim``-wide block of the input. Equivalent to
+        ``block_diag(H, H, ..., H) @ padded`` without materialising the
+        dense matrix. See ``_PolarQuant.__init__`` for the semantic
+        rationale.
+        """
+        if self.rotary_dim is None:
+            return _fast_wht_batch(padded)
+        return _fast_wht_batch_blocked(padded, block_size=self.rotary_dim)
 
     def _rotate(self, x: torch.Tensor) -> torch.Tensor:
         batch = x.shape[0]
@@ -116,7 +257,7 @@ class _PolarQuant:
         else:
             padded = x.clone()
         padded *= self.signs1.unsqueeze(0)
-        padded = _fast_wht_batch(padded)
+        padded = self._apply_wht(padded)
         padded *= self.signs2.unsqueeze(0)
         return padded[:, : self.dim]
 
@@ -128,7 +269,7 @@ class _PolarQuant:
         else:
             padded = y.clone()
         padded *= self.signs2.unsqueeze(0)
-        padded = _fast_wht_batch(padded)
+        padded = self._apply_wht(padded)
         padded *= self.signs1.unsqueeze(0)
         return padded[:, : self.dim]
 
