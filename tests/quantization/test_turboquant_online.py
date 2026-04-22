@@ -613,3 +613,118 @@ class TestPolarQuantBlockDiagonalRotation:
         # Both should match — the rotary_dim=dim case defensively sets
         # self.rotary_dim=None in __init__ (via the `< dim` gate).
         torch.testing.assert_close(q_full._rotate(x.clone()), q_rd_eq._rotate(x.clone()))
+
+
+# ============================================================================
+# MLA dequant-via-apply path
+#
+# vLLM's ``get_and_maybe_dequant_weights`` (quant_utils.py:352) uses a generic
+# ``layer.quant_method.apply(layer, eye, bias=None).T`` fallback for any quant
+# method without a fast-path. MLA (``mla_attention.py:740``) depends on this
+# to reconstruct the full ``kv_b_proj`` weight for its per-head W_UK / W_UV
+# bmm split. If that fallback doesn't produce the original weight (modulo
+# quantization error) we silently corrupt every MLA attention layer.
+#
+# The tests here exercise TurboQuantOnlineLinearMethod.apply() with an eye
+# matrix on Kimi-VL / DeepSeek-V3-sized kv_b_proj shapes and confirm round-trip
+# stays within the expected 3-bit reconstruction error envelope.
+# ============================================================================
+
+
+class TestMLADequantViaApply:
+    """Verify our quant method survives vLLM's generic dequant fallback."""
+
+    def _prep_layer(self, out_features: int, in_features: int, *, bits: int = 3):
+        """Minimal surface the Linear quant method needs.
+
+        TurboQuantOnlineLinearMethod.apply reads a handful of ``tq_*``
+        attributes + layer.tq_padded_in. process_weights_after_loading
+        writes those in place, so we feed it a plain Module with a weight.
+        """
+        method = TurboQuantOnlineLinearMethod(bits=bits, group_size=128)
+
+        class _FakeLinear(nn.Module):
+            pass
+
+        layer = _FakeLinear()
+        torch.manual_seed(0)
+        weight = torch.randn(out_features, in_features, dtype=torch.float32) * 0.02
+
+        # process_weights_after_loading reads layer.weight.data and tries to
+        # replace it with an empty tensor; wrap in a Parameter-lookalike.
+        class _FakeParam:
+            def __init__(self, data):
+                self.data = data
+
+        layer.weight = _FakeParam(weight.clone())
+        layer.input_size_per_partition = in_features
+        method.process_weights_after_loading(layer)
+        return method, layer, weight
+
+    @pytest.mark.parametrize(
+        "out_features,in_features",
+        [
+            # Kimi-VL-A3B / DeepSeek-V3: num_heads=16, qk_nope+v = 256, kv_lora=512
+            (16 * (128 + 128), 512),
+            # Kimi-K2 scale: num_heads=128, qk_nope+v = 256, kv_lora=512
+            (128 * (128 + 128), 512),
+            # Small sanity case
+            (256, 128),
+        ],
+    )
+    def test_apply_of_eye_reproduces_weight(self, out_features, in_features):
+        """``apply(layer, eye) == W.T`` within TQ3 quantization noise.
+
+        This is the code path vLLM's get_and_maybe_dequant_weights falls
+        into for any quant method without a fast dequant. MLA's
+        process_weights_after_loading depends on the returned tensor
+        being shaped and valued like the original weight.
+        """
+        method, layer, weight_orig = self._prep_layer(out_features, in_features)
+
+        # Mirror get_and_maybe_dequant_weights: apply to identity, then .T
+        eye = torch.eye(in_features, dtype=torch.float32)
+        out = method.apply(layer, eye, bias=None)
+        reconstructed_weight = out.T  # (out_features, in_features)
+
+        assert reconstructed_weight.shape == weight_orig.shape, (
+            f"dequant-via-apply shape wrong: got {reconstructed_weight.shape}, "
+            f"expected {weight_orig.shape}"
+        )
+        # TQ3 reconstruction error at group_size=128 is ~0.15 RMS relative.
+        rel_err = (
+            torch.linalg.norm(reconstructed_weight - weight_orig)
+            / torch.linalg.norm(weight_orig)
+        ).item()
+        assert rel_err < 0.25, (
+            f"dequant-via-apply rel_err {rel_err:.3f} too high; "
+            f"MLA W_UK/W_UV would be polluted"
+        )
+
+    def test_mla_kv_b_proj_split_shape(self):
+        """End-to-end check: reconstructed weight can be reshaped + split
+        the way MLA's process_weights_after_loading does."""
+        # Kimi-VL-A3B MLA shape
+        num_heads = 16
+        qk_nope_head_dim = 128
+        v_head_dim = 128
+        kv_lora_rank = 512
+        out_features = num_heads * (qk_nope_head_dim + v_head_dim)
+        method, layer, _ = self._prep_layer(out_features, kv_lora_rank)
+
+        eye = torch.eye(kv_lora_rank, dtype=torch.float32)
+        out = method.apply(layer, eye, bias=None)
+        kv_b_proj_weight = out.T.T  # first .T is apply's layout, second is MLA's
+
+        # MLA does:
+        assert kv_b_proj_weight.shape == (
+            kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim),
+        )
+        kv_b_proj_weight = kv_b_proj_weight.view(
+            kv_lora_rank, num_heads, qk_nope_head_dim + v_head_dim,
+        )
+        W_UK, W_UV = kv_b_proj_weight.split(
+            [qk_nope_head_dim, v_head_dim], dim=-1,
+        )
+        assert W_UK.shape == (kv_lora_rank, num_heads, qk_nope_head_dim)
+        assert W_UV.shape == (kv_lora_rank, num_heads, v_head_dim)
