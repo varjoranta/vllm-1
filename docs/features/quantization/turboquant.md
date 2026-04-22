@@ -51,8 +51,25 @@ llm = LLM(model="...", quantization="turboquant", quantization_config={"bits": 4
 ## What gets quantized
 
 - **Linear layers** — compressed to 3-bit (default) using `TurboQuantOnlineLinearMethod`.
-- **MoE experts** — kept at BF16 in this release. Dispatch falls back to the default unquantized MoE method. MoE support is planned in a follow-up.
+- **MoE experts** — compressed to 3-bit (default) using `TurboQuantOnlineFusedMoEMethod`. Each expert's `w13` and `w2` are packed via the same `_compress_2d` pipeline the Linear path uses; a shared scratch pool decompresses one layer at a time, then delegates to vLLM's unquantized MoE kernel. Validated end-to-end on Qwen3-30B-A3B-Instruct-2507 (E=128, top-k=8, hidden=2048, 48 layers): 13.69 GiB weight memory vs ~60 GiB BF16 (**4.4× compression**), **GSM8K-200 accuracy 91.5%** on H100 80GB.
+- **Attention projections on partial-rotary models** (`partial_rotary_factor < 1.0`, e.g. MiniMax M2.5/M2.7, Qwen3.6-A3B) use a **block-diagonal Walsh–Hadamard** rotation so the RoPE-rotated prefix and the content-only suffix stay under independent rotations inside a group. Detection is automatic from `VllmConfig.model_config.hf_text_config.partial_rotary_factor`; non-partial-rotary models run full-width WHT as before.
 - **Hardware-native FP4 (MXFP4/NVFP4) is out of scope.** The Walsh–Hadamard rotation is applied globally across each weight group, which is fine for per-row scaling but conflicts with per-block scaled formats — a global rotation spreads outlier mass across block boundaries and pollutes the per-block scales. Block-aligned rotation for those formats is a separate PR.
+
+### MoE-specific invocation notes
+
+The MoE path inherits from `OnlineMoEMethodBase` and requires a backend that does **not** permute expert weight storage during setup (FlashInfer-CUTLASS and AITER both do). On Hopper, vLLM auto-selects FlashInfer-CUTLASS for unquantized MoE, which our scratch-pool invariant can't tolerate — so force Triton explicitly:
+
+```python
+from vllm import LLM
+
+llm = LLM(
+    model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+    quantization="turboquant",
+    kernel_config={"moe_backend": "triton"},
+)
+```
+
+or via CLI: `vllm serve ... --quantization turboquant -cc.moe_backend=triton`. A clear `ValueError` is raised at `process_weights_after_loading` time if an incompatible backend is detected.
 
 Layers can be excluded via the `ignore` list in the `OnlineQuantizationConfigArgs`:
 
@@ -69,9 +86,15 @@ llm = LLM(
 ## Implementation notes
 
 - **Zero GPU memory at init**. Weights are allocated on the meta device; only the compressed form materializes on GPU, per layer, during `process_weights_after_loading`.
-- **Two Triton kernels** are registered as `torch.library.custom_op` with `register_fake`, so they're fullgraph- and `torch.compile`-safe. The runtime picks between them based on output dimension — a fused dequant-GEMM for smaller outputs, and an FWHT-on-input GEMM for larger outputs (single rotation of the activation instead of N inverse rotations of rows).
-- **BF16 tensor cores** are used for the main GEMM. The accumulator is kept in FP32.
+- **Two Triton kernels for Linear** are registered as `torch.library.custom_op` with `register_fake`, so they're fullgraph- and `torch.compile`-safe. The runtime picks between them based on output dimension — a fused dequant-GEMM for smaller outputs, and an FWHT-on-input GEMM for larger outputs (single rotation of the activation instead of N inverse rotations of rows).
+- **MoE path uses a Python-level dequant** into a module-level bf16 scratch pool (one `w13` + one `w2` buffer, shared across all MoE layers since only one layer runs at a time). The unquantized Triton MoE kernel then runs on the freshly-decompressed pool. A fused 3D CUDA dequant kernel is planned as a follow-up — the Python path is correct but ~5× slower than the theoretical fused path.
+- **Block-diagonal WHT (partial-rotary path)** runs through the PyTorch fallback — the current Triton kernels assume a full-width WHT and would produce incorrect output if applied to block-diag-compressed weights. A block-diag Triton variant is a natural follow-up.
+- **BF16 tensor cores** are used for the main Linear GEMM. The accumulator is kept in FP32.
 - A PyTorch fallback path runs when Triton is unavailable (useful for CPU debugging).
+
+## Known quirks
+
+- **`VLLM_USE_DEEP_GEMM=0`** should be set when running TurboQuant on a box that doesn't have the `deep_gemm` package installed. vLLM's `kernel_warmup` probes every Linear for possible DeepGEMM use and crashes if the package isn't importable, even though TurboQuant never hits that path. This is a vLLM infrastructure behavior unrelated to the algorithm.
 
 ## Minimum hardware
 
