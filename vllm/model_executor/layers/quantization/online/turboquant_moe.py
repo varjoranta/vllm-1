@@ -100,6 +100,46 @@ class _Compressed3D:
         dequant = dequant.reshape(n_experts, out_dim, self.padded_in)
         out.copy_(dequant[:, :, :in_dim])
 
+    def decompress_experts_into(
+        self, out: torch.Tensor, active_experts: torch.Tensor,
+    ) -> None:
+        """Sparse variant: decompress ONLY the expert indices listed in
+        ``active_experts`` (1-D int tensor of expert IDs, duplicates OK).
+        At MoE decode (bs=1, top-8 of 128 experts), this writes ~6% of the
+        data the full variant would — a ~16x reduction in weight-dequant
+        work.
+
+        The downstream ``fused_moe`` kernel routes through ``topk_ids`` and
+        only reads active slots, so stale contents in non-active slots
+        don't affect correctness. Output at listed indices is bit-identical
+        to the full decompress.
+
+        Phase 1 uses a Python loop over listed experts, which breaks CUDA
+        graph capture — callers must run with ``enforce_eager=True``.
+        Phase 2 replaces this with a GPU-resident kernel that takes
+        ``topk_ids`` directly and restores graph compatibility.
+        """
+        if active_experts.numel() == 0:
+            return
+        unique_experts = torch.unique(active_experts).tolist()
+
+        n_experts, out_dim, in_dim = self.shape
+        n_groups = self.padded_in // self.group_size
+        groups_per_expert = out_dim * n_groups
+        quantizer = _get_quantizer(self.group_size, self.bits, str(out.device))
+
+        for e in unique_experts:
+            if e < 0 or e >= n_experts:
+                continue
+            expert_packed = self.packed[e * groups_per_expert : (e + 1) * groups_per_expert]
+            expert_norms = self.norms_flat[e * groups_per_expert : (e + 1) * groups_per_expert]
+            indices = _unpack_indices(expert_packed, self.bits, self.padded_in)
+            dequant = quantizer.dequantize(
+                indices.reshape(-1, self.group_size), expert_norms,
+            )
+            dequant = dequant.reshape(1, out_dim, self.padded_in)
+            out[e : e + 1].copy_(dequant[:, :, :in_dim])
+
 
 # Module-level singleton. Only one MoE layer runs at a time during forward,
 # so one (w13, w2) scratch pair is enough across every MoE layer in the
@@ -234,10 +274,17 @@ class TurboQuantOnlineFusedMoEMethod(OnlineMoEMethodBase):
 
         layer._already_called_process_weights_after_loading = True
 
-    def _dequant_into_pool(self, layer: torch.nn.Module) -> None:
+    def _dequant_into_pool(
+        self, layer: torch.nn.Module,
+        active_experts: torch.Tensor | None = None,
+    ) -> None:
         pool = layer._tq_scratch_pool
-        layer._tq_w13_compressed.decompress_into(pool.w13)
-        layer._tq_w2_compressed.decompress_into(pool.w2)
+        if active_experts is None:
+            layer._tq_w13_compressed.decompress_into(pool.w13)
+            layer._tq_w2_compressed.decompress_into(pool.w2)
+        else:
+            layer._tq_w13_compressed.decompress_experts_into(pool.w13, active_experts)
+            layer._tq_w2_compressed.decompress_experts_into(pool.w2, active_experts)
 
     def apply(
         self,
@@ -247,7 +294,14 @@ class TurboQuantOnlineFusedMoEMethod(OnlineMoEMethodBase):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        self._dequant_into_pool(layer)
+        # SPARSE DEQUANT: dequant only the experts ``topk_ids`` routes to.
+        # Decompressing all N experts when the downstream ``fused_moe``
+        # kernel only reads top-k is 93.75% wasted work on typical configs
+        # (e.g. Qwen3-30B-A3B: 128 experts, top-8). Validated 8.4x decode
+        # speedup at bs=1 on H100 in the companion plugin PR
+        # (varjoranta/turboquant-vllm#33). Requires enforce_eager=True on
+        # vLLM — Phase 2 will add a GPU-resident sparse kernel.
+        self._dequant_into_pool(layer, active_experts=topk_ids.flatten())
         return super().apply(
             layer=layer,
             x=x,
