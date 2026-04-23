@@ -103,27 +103,31 @@ class _Compressed3D:
     def decompress_experts_into(
         self, out: torch.Tensor, active_experts: torch.Tensor,
     ) -> None:
-        """Sparse variant: decompress ONLY the expert indices listed in
-        ``active_experts`` (1-D int tensor of expert IDs, duplicates OK).
-        At MoE decode (bs=1, top-8 of 128 experts), this writes ~6% of the
-        data the full variant would — a ~16x reduction in weight-dequant
-        work.
+        """Decompress only ``active_experts`` into ``out``.
 
-        The downstream ``fused_moe`` kernel routes through ``topk_ids`` and
-        only reads active slots, so stale contents in non-active slots
-        don't affect correctness. Output at listed indices is bit-identical
-        to the full decompress.
+        Output at listed indices is bit-identical to the full decompress;
+        other slots are left untouched (the downstream ``fused_moe``
+        routes via ``topk_ids`` and doesn't read them).
 
-        Phase 1 uses a Python loop over listed experts, which breaks CUDA
-        graph capture — callers must run with ``enforce_eager=True``.
-        Phase 2 replaces this with a GPU-resident kernel that takes
-        ``topk_ids`` directly and restores graph compatibility.
+        Requires ``enforce_eager=True`` on vLLM in this Phase-1 form —
+        the Python loop breaks CUDA graph capture. A follow-up PR will
+        add a CUDA kernel variant that takes ``topk_ids`` directly.
         """
         if active_experts.numel() == 0:
             return
-        unique_experts = torch.unique(active_experts).tolist()
 
         n_experts, out_dim, in_dim = self.shape
+
+        # At prefill, batch*top_k quickly covers every expert (bs=16 top-8
+        # already = 128 = all of Qwen3-30B-A3B). Sparse iteration isn't a
+        # win when we're touching every expert anyway; full decompress is
+        # strictly faster + avoids the risk of a future CUDA sparse kernel
+        # overflowing grid.x.
+        if active_experts.numel() >= n_experts:
+            self.decompress_into(out)
+            return
+
+        unique_experts = torch.unique(active_experts).tolist()
         n_groups = self.padded_in // self.group_size
         groups_per_expert = out_dim * n_groups
         quantizer = _get_quantizer(self.group_size, self.bits, str(out.device))
