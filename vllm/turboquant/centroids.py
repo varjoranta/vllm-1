@@ -20,6 +20,17 @@ def _gaussian_pdf(x: float, sigma2: float) -> float:
     )
 
 
+def _gaussian_mass(a: float, b: float, sigma: float) -> float:
+    """Closed-form ∫_a^b N(0, σ²)(x) dx = ½·(erf(b/(σ√2)) - erf(a/(σ√2)))."""
+    k = sigma * math.sqrt(2)
+    return 0.5 * (math.erf(b / k) - math.erf(a / k))
+
+
+def _gaussian_first_moment(a: float, b: float, sigma2: float) -> float:
+    """Closed-form ∫_a^b x·N(0, σ²)(x) dx = -σ²·(pdf(b) - pdf(a))."""
+    return -sigma2 * (_gaussian_pdf(b, sigma2) - _gaussian_pdf(a, sigma2))
+
+
 def solve_lloyd_max(
     d: int,
     bits: int,
@@ -38,14 +49,9 @@ def solve_lloyd_max(
         centroids: Sorted tensor of 2^bits optimal centroids.
         boundaries: Sorted tensor of 2^bits - 1 decision boundaries.
     """
-    from scipy import integrate
-
     n_levels = 2**bits
     sigma2 = 1.0 / d
     sigma = math.sqrt(sigma2)
-
-    def pdf(x):
-        return _gaussian_pdf(x, sigma2)
 
     lo, hi = -3.5 * sigma, 3.5 * sigma
     centroids = [lo + (hi - lo) * (i + 0.5) / n_levels for i in range(n_levels)]
@@ -58,8 +64,8 @@ def solve_lloyd_max(
         new_centroids = []
         for i in range(n_levels):
             a, b = edges[i], edges[i + 1]
-            num, _ = integrate.quad(lambda x: x * pdf(x), a, b)
-            den, _ = integrate.quad(pdf, a, b)
+            num = _gaussian_first_moment(a, b, sigma2)
+            den = _gaussian_mass(a, b, sigma)
             new_centroids.append(num / den if den > 1e-15 else centroids[i])
 
         if max(abs(new_centroids[i] - centroids[i]) for i in range(n_levels)) < tol:
